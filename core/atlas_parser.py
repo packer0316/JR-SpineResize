@@ -114,12 +114,24 @@ def parse_atlas_text(text: str) -> AtlasFile:
     return atlas
 
 
+def _read_raw(path: Path, errors: str = "strict") -> str:
+    """
+    讀檔但**不做換行轉換**（``newline=""``）。
+
+    用 ``read_text()`` 會走 universal newlines 把 CRLF 轉成 LF，
+    ``parse_atlas_text`` 就永遠偵測不到 CRLF，寫回去時整份檔案的換行符
+    會被改成 LF——內容一樣但 diff 全紅，也讓「原封不動」的承諾破功。
+    """
+    with path.open("r", encoding="utf-8", errors=errors, newline="") as handle:
+        return handle.read()
+
+
 def parse_atlas_file(path: Path) -> AtlasFile:
     """讀取並解析 .atlas 檔案。"""
     try:
-        text = path.read_text(encoding="utf-8")
+        text = _read_raw(path)
     except UnicodeDecodeError:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = _read_raw(path, errors="replace")
     except OSError as exc:
         raise AtlasParseError(f"無法讀取 {path.name}：{exc}") from exc
 

@@ -43,7 +43,8 @@ def load_options() -> ProcessOptions:
 
     return ProcessOptions(
         mode=s.value("mode", MODE_RESCALE, type=str),
-        resize_enabled=s.value("scale/enabled", True, type=bool),
+        # 沒有存過設定時預設關閉（縮小貼圖不可逆，要縮得是明確的選擇）
+        resize_enabled=s.value("scale/enabled", False, type=bool),
         scale_percent=s.value("scale/percent", DEFAULT_SCALE_PERCENT, type=float),
         resample=s.value("scale/resample", DEFAULT_RESAMPLE, type=str),
         alpha_mode=s.value("scale/alpha_mode", ALPHA_MODE_PREMULTIPLY, type=str),

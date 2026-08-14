@@ -46,7 +46,14 @@ from utils.image_utils import premultiply, resize_block, to_rgba_array
 
 
 def check_round_trip(atlas_files: list[Path]) -> int:
-    print("\n[1] atlas round-trip（讀進來再寫出去必須完全相同）")
+    """
+    讀進來再寫出去必須 byte-identical。
+
+    刻意比 **bytes** 而不是 ``read_text()``：後者會做 universal newlines，
+    把 CRLF 正規化成 LF，於是「換行符被改掉」這種差異會整個看不到
+    （實際上就曾經漏掉過一次）。
+    """
+    print("\n[1] atlas round-trip（讀進來再寫出去必須 byte-identical）")
     failed = 0
     for path in atlas_files:
         try:
@@ -55,8 +62,13 @@ def check_round_trip(atlas_files: list[Path]) -> int:
             print(f"    ✕ 解析失敗 {path.name}: {exc}")
             failed += 1
             continue
-        if atlas.to_text() != path.read_text(encoding="utf-8"):
-            print(f"    ✕ round-trip 不一致 {path.name}")
+        original = path.read_bytes()
+        produced = atlas.to_text().encode("utf-8")
+        if produced != original:
+            hint = ""
+            if produced.replace(b"\r\n", b"\n") == original.replace(b"\r\n", b"\n"):
+                hint = "（只差在換行符）"
+            print(f"    ✕ round-trip 不一致 {path.name}{hint}")
             failed += 1
     print(f"    {len(atlas_files) - failed} / {len(atlas_files)} 通過")
     return failed
@@ -172,6 +184,7 @@ def main() -> int:
     scale = percent / 100.0
     options = ProcessOptions(
         mode=MODE_RESCALE,
+        resize_enabled=True,   # 這支腳本就是在驗縮放，明確開啟（預設是關的）
         scale_percent=percent,
         output_mode=OUTPUT_SUBFOLDER,
         subfolder_name="out",

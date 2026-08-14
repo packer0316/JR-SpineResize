@@ -179,6 +179,34 @@ class SheetLayout:
         first = self.placements[0].scale
         return first if all(abs(p.scale - first) < 1e-9 for p in self.placements) else None
 
+    @property
+    def is_identity(self) -> bool:
+        """
+        與原始貼圖完全相同的版面（比例 1.0、位置與畫布都照原樣）。
+
+        這種版面的意義是「這張合圖不要動」：輸出的 atlas 數值與原檔一模一樣，
+        貼圖也是逐塊 1:1 複製（``resize_block`` 對同尺寸會直接回傳原內容），
+        所以連 PNG 的像素都不會變。用來把某張合圖排除在全域縮放之外。
+        """
+        if not self.placements or self.canvas != self.src_canvas:
+            return False
+        return all(
+            abs(p.scale - 1.0) < 1e-9 and p.pos == (p.src_rect[0], p.src_rect[1])
+            for p in self.placements
+        )
+
+    def reset_to_source(self) -> None:
+        """
+        還原成原始版面：比例 1.0、位置與畫布都回到來源 atlas 的樣子。
+
+        每個元件都標成 pinned，之後若使用者又按「重新排版」才會被移動。
+        """
+        for placement in self.placements:
+            placement.set_scale(1.0)
+            placement.pos = (placement.src_rect[0], placement.src_rect[1])
+            placement.pinned = True
+        self.canvas = self.src_canvas
+
     def by_rect(self) -> dict[Rect, Placement]:
         return {p.src_rect: p for p in self.placements}
 
@@ -230,6 +258,11 @@ class SheetLayout:
         )
 
     def describe(self) -> str:
+        if self.is_identity:
+            return (
+                f"{self.src_canvas[0]}x{self.src_canvas[1]} 原始版面"
+                f"（{len(self.placements)} 個元件、不縮放）"
+            )
         scale = self.uniform_scale
         scale_text = f"{scale * 100:g}%" if scale is not None else "各區塊不同比例"
         return (

@@ -437,7 +437,10 @@ def _process_page(
             return None
 
         if layout is not None:
-            scale = 0.0  # 版面模式沒有單一比例
+            # 版面模式沒有單一比例，用 0 讓「絕不變大保護」失效（像素一定變了）。
+            # 例外是「原始版面」：輸出與原檔逐像素相同，這時就該比照 100% 處理，
+            # 壓縮沒收益時直接沿用原檔。
+            scale = 1.0 if layout.is_identity else 0.0
             canvas = layout.canvas
             mapping, unmatched = build_layout_mapping(page, layout)
             if unmatched:
@@ -501,16 +504,29 @@ def _process_page(
             return None
 
         src_bytes = src_path.stat().st_size
-        if layout is not None:
+        if layout is not None and layout.is_identity:
+            # 原始版面＝這張合圖不要動：連重繪都跳過，直接拿來源像素去壓縮。
+            # 走重繪路徑的話邊緣滲出會改到透明區的 RGB，就不是「原封不動」了。
+            image = source
+            report.add(
+                LEVEL_INFO,
+                f"[{page.name}] 使用原始版面，貼圖像素與 atlas 座標維持原樣（只做壓縮）",
+            )
+        elif layout is not None:
             # 版面模式畫的是「版面上的所有元件」，不是這一份 atlas 的區塊清單——
             # 共用這張合圖的其他 atlas 需要的像素也必須在圖裡
             render = render_sheet(source, layout, settings, page.is_premultiplied)
+            image = render.image
+            for note in render.notes:
+                report.add(LEVEL_INFO, f"[{page.name}] {note}")
         else:
             render = render_page(source, mapping, settings)
-        for note in render.notes:
-            report.add(LEVEL_INFO, f"[{page.name}] {note}")
+            image = render.image
+            for note in render.notes:
+                report.add(LEVEL_INFO, f"[{page.name}] {note}")
+
         payload, encoding, dst_bytes = _encode_texture(
-            render.image,
+            image,
             dst_path,
             src_path,
             scale,
@@ -695,10 +711,13 @@ def build_preview(
                         f"{page.name} 的合圖版面與 atlas 不同步"
                         f"（{len(unmatched)} 個區塊找不到對應元件）"
                     )
-                rendered = render_sheet(
+                # 與 _process_page 一致：原始版面不重繪，直接用來源像素
+                rendered = source if layout.is_identity else render_sheet(
                     source, layout, settings, page.is_premultiplied
                 ).image
-                page_scale = 0.0  # 版面模式：像素一定變了，不套用「絕不變大」保護
+                # 版面模式像素一定變了，不套用「絕不變大」保護；
+                # 「原始版面」除外（輸出與原檔逐像素相同）
+                page_scale = 1.0 if layout.is_identity else 0.0
             else:
                 canvas = (
                     max(1, align_up(round_half_up(declared[0] * scale), options.page_align)),

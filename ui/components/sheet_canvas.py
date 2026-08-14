@@ -49,6 +49,10 @@ class _Drag:
     start_positions: dict[int, tuple[int, int]] | None = None
     start_scales: dict[int, float] | None = None
     start_offset: QPointF | None = None
+    # 按下時的選取範圍：縮放比例一律以「這個」為基準算。
+    # 若改用當下的範圍，元件變大會讓基準跟著變大 → 比例又變小 → 元件縮回去，
+    # 滑鼠沒動也會在兩個尺寸之間來回跳（就是「大小不受控」的成因）。
+    start_bounds: tuple[int, int, int, int] | None = None
     anchor: tuple[int, int] = (0, 0)  # resize 時固定不動的角
     moved: bool = False
 
@@ -109,6 +113,15 @@ class SheetCanvas(QWidget):
         if self._layout is not None:
             self.select(list(self._layout.placements))
 
+    def unpin_all(self) -> int:
+        """取消所有元件的位置固定；回傳原本被固定的數量"""
+        if self._layout is None:
+            return 0
+        pinned = [p for p in self._layout.placements if p.pinned]
+        for placement in pinned:
+            placement.pinned = False
+        return len(pinned)
+
     def set_show_names(self, enabled: bool) -> None:
         self._show_names = enabled
         self.update()
@@ -141,6 +154,14 @@ class SheetCanvas(QWidget):
     @property
     def view_scale(self) -> float:
         return self._view_scale
+
+    def canvas_fits(self) -> bool:
+        """目前的檢視是否看得到整張合圖（重排後畫布長大時用來判斷要不要重新置中）"""
+        layout = self._layout
+        if layout is None or layout.canvas[0] <= 0:
+            return True
+        rect = self._view_rect((0, 0, *layout.canvas))
+        return self.rect().contains(rect.toRect())
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -249,6 +270,7 @@ class SheetCanvas(QWidget):
                 corner=corner,
                 start_scales={id(p): p.scale for p in self._selected},
                 start_positions={id(p): p.pos for p in self._selected if p.pos},  # type: ignore[misc]
+                start_bounds=bounds,
                 anchor=_anchor_of(bounds, corner),
             )
             return
@@ -352,6 +374,11 @@ class SheetCanvas(QWidget):
             return
         dx = round(delta.x() / self._view_scale)
         dy = round(delta.y() / self._view_scale)
+        if dx == 0 and dy == 0:
+            # 只是點一下選取（真實滑鼠按下就會伴隨 move 事件），位置沒變就不能
+            # 把元件標成「固定」——被固定的元件不參與自動排版，累積幾個之後
+            # 版面就縮不下去了，使用者完全不知道自己何時固定過。
+            return
         canvas_w, canvas_h = self._layout.canvas
         for placement in self._selected:
             start = drag.start_positions.get(id(placement))
@@ -369,24 +396,27 @@ class SheetCanvas(QWidget):
         """
         以固定角為錨點等比縮放選取的元件。
 
-        比例取「拖到哪裡 / 原本的大小」，兩軸取較大的變化量，這樣不論拖橫拖直
-        都跟得上手感，而元件本身永遠是等比的。
+        比例＝把「滑鼠相對錨點的位移」投影到「按下時那條對角線」上的長度比。
+        兩個關鍵：
+
+        * 基準一律用 ``drag.start_bounds``（按下時的範圍），不是當下的範圍。
+          用當下的範圍會形成回饋迴路：元件變大 → 基準變大 → 比例變小 →
+          元件縮回去，滑鼠不動也會一直跳。
+        * 投影而不是「兩軸取較大的變化量」：後者會在斜拖時於 x/y 之間切換，
+          每次切換就跳一下。投影是連續的，而且等比縮放時控制點本來就只能
+          沿著對角線走，投影點正是對角線上離滑鼠最近的位置。
         """
-        if self._layout is None or not drag.start_scales:
-            return
-        bounds = self._selection_bounds()
-        if bounds is None:
+        if self._layout is None or not drag.start_scales or drag.start_bounds is None:
             return
         anchor_x, anchor_y = drag.anchor
-        sheet_x, sheet_y = self._to_sheet(position)
+        corner_x, corner_y = _corner_of(drag.start_bounds, drag.corner)
+        diag_x, diag_y = corner_x - anchor_x, corner_y - anchor_y
+        span = diag_x * diag_x + diag_y * diag_y
+        if span <= 0:
+            return
 
-        start_w = max(1.0, abs(_corner_of(bounds, drag.corner)[0] - anchor_x))
-        start_h = max(1.0, abs(_corner_of(bounds, drag.corner)[1] - anchor_y))
-        new_w = max(1.0, abs(sheet_x - anchor_x))
-        new_h = max(1.0, abs(sheet_y - anchor_y))
-        ratio_w, ratio_h = new_w / start_w, new_h / start_h
-        # 取離 1 較遠的那一軸，手感比較直接
-        ratio = ratio_w if abs(ratio_w - 1.0) >= abs(ratio_h - 1.0) else ratio_h
+        sheet_x, sheet_y = self._to_sheet(position)
+        ratio = ((sheet_x - anchor_x) * diag_x + (sheet_y - anchor_y) * diag_y) / span
         ratio = max(0.02, min(20.0, ratio))
 
         for placement in self._selected:

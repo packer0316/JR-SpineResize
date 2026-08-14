@@ -33,7 +33,7 @@ from core.project_file import (
     save_project_file,
 )
 from core.sheet_group import build_sheet_groups, groups_for_project
-from models.sheet_layout import LayoutStore
+from models.sheet_layout import LayoutStore, layout_key
 from models.size_estimate import aggregate_estimates
 from models.spine_project import STATUS_APPLIED, STATUS_IDLE, SpineProject
 from ui.components.project_detail import ProjectDetail
@@ -282,6 +282,8 @@ class MainWindow(QMainWindow):
 
     def _apply_theme(self, key: str) -> None:
         self.setStyleSheet(build_stylesheet(THEMES.get(key, THEMES["dark"])))
+        # 清單的共用貼圖分組色是用 QColor 直接上的，不吃 stylesheet，要另外通知
+        self.project_list.set_theme(key)
         user_settings.save_theme(key)
 
     # ------------------------------------------------------------ 載入
@@ -721,18 +723,27 @@ class MainWindow(QMainWindow):
         for layout in layouts:
             self._layouts.put(layout)
 
-        self._invalidate_sheet_users(groups, {l.key for l in layouts} | removed)
-        self.status_label.setText(
-            f"已更新 {len(layouts)} 張合圖的版面"
-            + (f"、移除 {len(removed)} 張" if removed else "")
+        newly_applied = self._invalidate_sheet_users(
+            groups, {item.key for item in layouts} | removed
         )
+        parts = [f"已更新 {len(layouts)} 張合圖的版面"] if layouts else []
+        if removed:
+            parts.append(f"移除 {len(removed)} 張的自訂版面")
+        if newly_applied:
+            parts.append(f"順便套用設定到相關的 {newly_applied} 份專案")
+        self.status_label.setText("、".join(parts))
 
-    def _invalidate_sheet_users(self, groups, keys: set[str]) -> None:
+    def _invalidate_sheet_users(self, groups, keys: set[str]) -> int:
         """
         版面變了：所有用到這些合圖的專案都要重算預覽與估算。
 
         一張合圖被三份專案共用時，三份的預估容量與播放預覽全部得跟著更新，
         不能只更新目前選到的那一份。
+
+        還沒套用設定的專案會**順便套用目前右側的設定**：套用版面本身就是
+        「我要改這張圖的輸出」的意思，若不一起套用，清單的容量變化與播放
+        預覽都不會有任何變化（要處理時也會被略過），看起來就像沒生效。
+        編輯器的起始比例本來就是取自右側設定，兩者是一致的。
         """
         affected: list[SpineProject] = []
         for group in groups:
@@ -742,10 +753,16 @@ class MainWindow(QMainWindow):
                 if not any(p is project for p in affected):
                     affected.append(project)
 
+        newly_applied = 0
         for project in affected:
-            project.size_estimate = None
-            self._preview_cache.pop(id(project), None)
+            if project.applied_options is None and project.can_process:
+                self._apply_to(project)
+                newly_applied += 1
+            else:
+                project.size_estimate = None
+                self._preview_cache.pop(id(project), None)
 
+        # 這裡面會順便重畫檔案面板的「✎自訂版面」標記
         self._sync_layout_marks()
         self.project_list.refresh_all()
         current = self.project_list.current_project()
@@ -755,10 +772,17 @@ class MainWindow(QMainWindow):
                 self._attach_preview(current)
         self._start_estimates()
         self._update_footer()
+        if newly_applied:
+            user_settings.save_options(self.settings_panel.get_options())
+        return newly_applied
 
     def _sync_layout_marks(self) -> None:
-        """把「哪些貼圖有自訂版面」同步給清單與檔案面板"""
+        """把「哪些貼圖有自訂版面」同步給各專案、清單與檔案面板"""
         keys = {layout.key for layout in self._layouts}
+        for project in self.project_list.projects:
+            project.custom_sheets = sum(
+                1 for path in project.page_paths if layout_key(path) in keys
+            )
         self.project_list.set_custom_layouts(keys)
         self.detail.set_custom_layouts(keys)
 

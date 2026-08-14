@@ -28,8 +28,9 @@ class ProcessOptions:
     mode: str = MODE_RESCALE
 
     # ---- 尺寸調整（綁定整個 Spine 專案）--------------------------------
-    # 關閉時比例固定 100%，變成「只壓縮、不縮放」
-    resize_enabled: bool = True
+    # 預設關閉：縮小貼圖是不可逆的破壞性操作，預設就開著容易在不留意時
+    # 把整批素材縮掉。關閉時比例固定 100%，工具等於純批次壓縮器。
+    resize_enabled: bool = False
     scale_percent: float = DEFAULT_SCALE_PERCENT
     resample: str = DEFAULT_RESAMPLE
     alpha_mode: str = ALPHA_MODE_PREMULTIPLY

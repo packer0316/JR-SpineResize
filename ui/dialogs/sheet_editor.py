@@ -80,6 +80,12 @@ class SheetEditorDialog(QDialog):
         self._sources: dict[str, Image.Image | None] = {}
         self._touched: set[str] = set()
         self._removed: set[str] = set()
+        # 開啟這個對話框時「已經套用過」的合圖。點開來看會建一份預覽版面放進
+        # _working，但那還不算自訂——只有按過「套用版面」的才算，
+        # 所以狀態欄要看這個集合，不能看 _working 有沒有東西。
+        self._committed: set[str] = {
+            group.key for group in self._groups if layouts.has(group.page_path)
+        }
         self._current: SheetGroup | None = None
         self._syncing = False
 
@@ -275,12 +281,24 @@ class SheetEditorDialog(QDialog):
         apply_all.setToolTip("把上面的比例套用到這張合圖的所有元件（含已個別調整過的）")
         apply_all.clicked.connect(self._apply_group_scale)
         apply_row.addWidget(apply_all, 1)
+        box.addLayout(apply_row)
+
+        revert_row = QHBoxLayout()
+        self.revert_button = QPushButton("還原原始版面")
+        self.revert_button.setToolTip(
+            "回到來源 atlas 原本的樣子：比例 100%、位置與頁面尺寸都照原檔\n"
+            "輸出的 atlas 會與原檔 byte-identical，貼圖像素也維持原樣\n"
+            "（等於「這張合圖不要動」——右側的縮放比例對它不生效，\n"
+            "壓縮設定仍然生效）"
+        )
+        self.revert_button.clicked.connect(self._revert_layout)
+        revert_row.addWidget(self.revert_button, 1)
 
         self.reset_button = QPushButton("移除自訂版面")
-        self.reset_button.setToolTip("這張合圖改回照全域比例整頁等比縮放")
+        self.reset_button.setToolTip("這張合圖改回照右側設定的全域比例整頁等比縮放")
         self.reset_button.clicked.connect(self._remove_layout)
-        apply_row.addWidget(self.reset_button)
-        box.addLayout(apply_row)
+        revert_row.addWidget(self.reset_button, 1)
+        box.addLayout(revert_row)
 
         self.mixed_label = QLabel("")
         self.mixed_label.setProperty("role", "hint")
@@ -358,6 +376,14 @@ class SheetEditorDialog(QDialog):
         pack_button.clicked.connect(lambda: self._repack(force=True))
         box.addWidget(pack_button)
 
+        self.unpin_all_button = QPushButton("取消全部固定並重排")
+        self.unpin_all_button.setToolTip(
+            "被固定的元件不參與自動排版，累積幾個之後版面就縮不下去了。\n"
+            "這個按鈕把整張合圖的固定全部解除，再重新排一次。"
+        )
+        self.unpin_all_button.clicked.connect(self._unpin_all)
+        box.addWidget(self.unpin_all_button)
+
         self.canvas_label = QLabel("")
         self.canvas_label.setProperty("role", "stat")
         self.canvas_label.setWordWrap(True)
@@ -396,19 +422,26 @@ class SheetEditorDialog(QDialog):
         return item
 
     def _sheet_state_item(self, group: SheetGroup) -> QTableWidgetItem:
-        # 先看有沒有改動：移除後又動過的，狀態是「已改動」而不是「已移除」
+        """
+        版面欄的三種狀態：
+
+        * ``已改動``  這次動過、按下「套用版面」才會生效
+        * ``自訂``    之前已經套用過的版面
+        * ``—``       沒有自訂版面（照全域比例）——只是點開來看也是這個
+        """
         layout = self._working.get(group.key)
-        if group.key not in self._touched:
-            if group.key in self._removed:
-                return QTableWidgetItem("已移除")
-            if layout is None:
-                return QTableWidgetItem("—")
-        if layout is None:
+        if group.key in self._touched:
+            text = "已改動"
+        elif group.key in self._removed:
+            text = "已移除"
+        elif group.key in self._committed:
+            text = "自訂"
+        else:
             return QTableWidgetItem("—")
-        text = "已改動" if group.key in self._touched else "自訂"
+
         item = QTableWidgetItem(text)
-        ratio = layout.area_ratio()
-        item.setToolTip(f"{layout.describe()}（面積 {ratio * 100:.0f}%）")
+        if layout is not None:
+            item.setToolTip(f"{layout.describe()}（面積 {layout.area_ratio() * 100:.0f}%）")
         return item
 
     def _refresh_current_row(self) -> None:
@@ -489,7 +522,8 @@ class SheetEditorDialog(QDialog):
         for widget in (
             self.group_slider, self.group_spin, self.item_spin,
             self.padding_spin, self.align_combo, self.auto_check,
-            self.reset_button, self.names_check,
+            self.reset_button, self.revert_button, self.names_check,
+            self.unpin_all_button,
         ):
             widget.setEnabled(enabled)
 
@@ -552,14 +586,25 @@ class SheetEditorDialog(QDialog):
         self._apply_group_scale()
 
     def _apply_group_scale(self) -> None:
-        """整組同一個比例——共用這張合圖的每一份 atlas 都會拿到這個結果"""
+        """
+        整組同一個比例——共用這張合圖的每一份 atlas 都會拿到這個結果。
+
+        會一併取消所有「位置固定」：固定的位置是在別的比例下挑的，換了比例就
+        沒有意義，留著只會讓畫布縮不下去（例如一個固定在 y=760 的元件會讓
+        整張圖即使縮到 17% 仍然高 780px，填充率掉到兩成）。
+        """
         layout = self.canvas.layout
         if layout is None:
             return
         layout.scale_all(self.group_spin.value() / 100.0)
+        unpinned = self.canvas.unpin_all()
         self._mark_touched()
-        self._repack()
+        self._repack(force=True)
         self._sync_selection_panel()
+        if unpinned and not self.warn_label.text():
+            self.warn_label.setText(
+                f"整組改比例，已取消 {unpinned} 個元件的位置固定並重新排版"
+            )
 
     def _on_item_scale(self, value: float) -> None:
         if self._syncing or value < MIN_REGION_SCALE * 100:
@@ -570,14 +615,14 @@ class SheetEditorDialog(QDialog):
         for placement in selected:
             placement.set_scale(value / 100.0)
         self._mark_touched()
-        self._repack()
+        self._repack(refit=False)
         self._sync_selection_panel()
 
     def _on_canvas_edited(self, resized: bool) -> None:
-        """畫布上拖曳完成"""
+        """畫布上拖曳完成：只重排，檢視維持原樣（免得畫面跟著跳）"""
         self._mark_touched()
         if resized:
-            self._repack()
+            self._repack(refit=False)
         else:
             self._sync_stats()
         self._sync_selection_panel()
@@ -602,6 +647,46 @@ class SheetEditorDialog(QDialog):
         self._mark_touched()
         self._repack(force=True)
 
+    def _unpin_all(self) -> None:
+        """整張合圖取消固定並重排（版面縮不下去時的救命按鈕）"""
+        count = self.canvas.unpin_all()
+        if not count:
+            self.warn_label.setText("這張合圖沒有被固定的元件")
+            return
+        self._mark_touched()
+        self._repack(force=True)
+        if not self.warn_label.text():
+            self.warn_label.setText(f"已取消 {count} 個元件的固定並重新排版")
+
+    def _revert_layout(self) -> None:
+        """
+        還原成來源 atlas 原本的版面。
+
+        刻意**不**接著重新排版：重排會把畫布縮到內容邊界，就不是原檔的樣子了。
+        還原後的版面是「恆等版面」，輸出的 atlas 與貼圖都與原檔相同。
+        """
+        layout = self.canvas.layout
+        if layout is None:
+            group = self._current
+            if group is None:
+                return
+            layout = group.build_layout(scale=1.0, padding=self.padding_spin.value())
+            self._working[group.key] = layout
+            self.canvas.set_sheet(layout, self._source_for(group))
+
+        layout.reset_to_source()
+        self._mark_touched()
+        self._syncing = True
+        try:
+            self.group_spin.setValue(100.0)
+            self.group_slider.setValue(100)
+        finally:
+            self._syncing = False
+        self.canvas.fit_to_view()
+        self._sync_stats()
+        self._sync_selection_panel()
+        self._refresh_current_row()
+
     def _remove_layout(self) -> None:
         """這張合圖改回「照全域比例整頁等比縮放」"""
         group = self._current
@@ -620,8 +705,14 @@ class SheetEditorDialog(QDialog):
         self._refresh_current_row()
         self._sync_footer()
 
-    def _repack(self, force: bool = False) -> None:
-        """重新排版並更新統計；auto 關閉時只在 force 時真的重排"""
+    def _repack(self, force: bool = False, refit: bool = True) -> None:
+        """
+        重新排版並更新統計；auto 關閉時只在 force 時真的重排。
+
+        ``refit`` 為 False 時保持目前的檢視（縮放與位置都不動）。改動整組比例、
+        間距、對齊這類「整體」操作重新置中是合理的，但單獨拖一個元件時把檢視
+        縮放整個換掉會讓畫面一直跳，反而看不出自己改了什麼。
+        """
         layout = self.canvas.layout
         if layout is None:
             return
@@ -632,9 +723,9 @@ class SheetEditorDialog(QDialog):
                 self.warn_label.setText(
                     f"{len(overflow)} 個元件排不進頁面上限，請縮小比例"
                 )
-        # 只有畫布尺寸真的變了才重新置中——否則使用者放大檢查細節時
-        # 每按一下方向鍵都會被縮回全景
-        if layout.canvas != before:
+        if layout.canvas != before and (refit or not self.canvas.canvas_fits()):
+            # refit=False 時只有「畫布長大到看不完整」才被動重新置中，
+            # 免得改個元件就看不到自己在改哪裡
             self.canvas.fit_to_view()
         else:
             self.canvas.update()
@@ -688,13 +779,26 @@ class SheetEditorDialog(QDialog):
         new_w, new_h = layout.canvas
         ratio = layout.area_ratio()
         fill = layout.used_area / (new_w * new_h) * 100 if new_w and new_h else 0.0
-        colour = DELTA_DOWN_COLOUR if ratio <= 1.0 else DELTA_UP_COLOUR
-        arrow = "↓" if ratio <= 1.0 else "↑"
-        self.canvas_label.setText(
-            f"{src_w}x{src_h} → {new_w}x{new_h}<br>"
-            f"<span style='color:{colour}'>面積 {arrow}{abs(1 - ratio) * 100:.0f}%</span>"
-            f"　填充 {fill:.0f}%"
-        )
+        if layout.is_identity:
+            # 恆等版面：講清楚它同時也是「不吃全域比例」的意思，
+            # 否則使用者會以為右側設定的 50% 還是會生效。
+            # 壓縮設定仍然生效，這點要一起講，不能只說「與原檔相同」
+            self.canvas_label.setText(
+                f"{src_w}x{src_h}　<b>原始版面</b><br>"
+                f"<span style='color:{DELTA_DOWN_COLOUR}'>"
+                "atlas 座標與貼圖像素維持原樣</span>"
+                "<br>不吃右側的縮放比例（壓縮設定仍然生效）"
+            )
+        else:
+            colour = DELTA_DOWN_COLOUR if ratio <= 1.0 else DELTA_UP_COLOUR
+            arrow = "↓" if ratio <= 1.0 else "↑"
+            pinned = sum(1 for p in layout.placements if p.pinned)
+            pin_text = f"　固定 {pinned} 個" if pinned else ""
+            self.canvas_label.setText(
+                f"{src_w}x{src_h} → {new_w}x{new_h}<br>"
+                f"<span style='color:{colour}'>面積 {arrow}{abs(1 - ratio) * 100:.0f}%</span>"
+                f"　填充 {fill:.0f}%{pin_text}"
+            )
 
         overlaps = _overlapping(layout)
         self.canvas.set_overlapping(overlaps)
@@ -707,6 +811,13 @@ class SheetEditorDialog(QDialog):
         tiny = [p for p in layout.placements if min(p.dst_size) <= 2]
         if tiny:
             messages.append(f"{len(tiny)} 個元件縮到只剩 1~2 px，畫面上會看不出內容")
+        # 填充率很低幾乎都是「固定的元件把畫布撐開」造成的，直接指路
+        pinned = sum(1 for p in layout.placements if p.pinned)
+        if pinned and fill < 55 and not layout.is_identity:
+            messages.append(
+                f"填充只有 {fill:.0f}%：有 {pinned} 個元件位置被固定，"
+                "畫布縮不下去——可按「取消全部固定並重排」"
+            )
         self.warn_label.setText("　".join(messages))
 
         scale = layout.uniform_scale

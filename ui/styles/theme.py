@@ -80,6 +80,33 @@ THEMES = {"light": LIGHT, "dark": DARK}
 DELTA_DOWN_COLOUR = "#16a34a"
 DELTA_UP_COLOUR = "#dc2626"
 
+# 共用貼圖的分組色：同一群同色、相鄰的群一定不同色。
+# 全部用同一個藍色的話，「5 份共用」與「3 份共用」兩群排在一起就分不出界線。
+# 沒有共用的專案不上色（維持一般文字色），視覺上一眼就看得出哪些是散的。
+SHARED_GROUP_COLOURS_LIGHT = (
+    "#1D4ED8",  # 藍
+    "#047857",  # 綠
+    "#B45309",  # 琥珀
+    "#BE185D",  # 桃紅
+    "#6D28D9",  # 紫
+    "#0E7490",  # 青
+    "#C2410C",  # 橘
+)
+SHARED_GROUP_COLOURS_DARK = (
+    "#60A5FA",
+    "#34D399",
+    "#FBBF24",
+    "#F472B6",
+    "#A78BFA",
+    "#22D3EE",
+    "#FB923C",
+)
+
+
+def shared_group_colours(theme_key: str) -> tuple[str, ...]:
+    """依主題取分組色（深色主題要亮一點才看得清楚）"""
+    return SHARED_GROUP_COLOURS_DARK if theme_key == "dark" else SHARED_GROUP_COLOURS_LIGHT
+
 
 def build_stylesheet(p: Palette) -> str:
     check_url = checkmark_icon(p.primary)

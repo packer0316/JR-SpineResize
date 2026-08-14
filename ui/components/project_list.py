@@ -11,10 +11,11 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
 )
 
+from core.sheet_group import cluster_projects
 from models.sheet_layout import layout_key
 from models.spine_project import SpineProject
 from ui.components.project_filter import FilterCriteria
-from ui.styles.theme import DELTA_DOWN_COLOUR, DELTA_UP_COLOUR
+from ui.styles.theme import DELTA_DOWN_COLOUR, DELTA_UP_COLOUR, shared_group_colours
 from utils.file_utils import format_bytes, format_size_delta
 
 _COLUMNS = ("名稱", "Spine", "合圖", "頁面尺寸", "區塊", "貼圖", "狀態", "容量變化")
@@ -28,8 +29,6 @@ _COL_DELTA = len(_COLUMNS) - 1
 #   貼圖「709.4 KB」/ 狀態「已套用 100%」/ 容量變化「1023.9 KB ↓100.0%」
 _COL_WIDTHS = {1: 52, _COL_SHEET: 120, 3: 82, 4: 42, 5: 72, 6: 92, _COL_DELTA: 126}
 
-# 共用貼圖的標示色（與狀態欄的藍色一致，代表「要注意，但不是錯誤」）
-_SHARED_COLOUR = "#2f6fed"
 
 
 class ProjectList(QTableWidget):
@@ -47,6 +46,10 @@ class ProjectList(QTableWidget):
         self._page_users: dict[str, int] = {}
         # 有自訂合圖版面的貼圖（由主視窗同步進來，只用於清單標示）
         self._custom_layouts: set[str] = set()
+        # id(project) -> 共用群編號；群編號 -> 顏色（依顯示順序輪替，相鄰群不同色）
+        self._clusters: dict[int, int] = {}
+        self._group_colours: dict[int, str] = {}
+        self._palette = shared_group_colours("dark")
 
         self.setHorizontalHeaderLabels(_COLUMNS)
         self.verticalHeader().setVisible(False)
@@ -104,6 +107,44 @@ class ProjectList(QTableWidget):
         self._custom_layouts = set(keys)
         self.refresh_all()
 
+    def set_theme(self, theme_key: str) -> None:
+        """換主題時重挑分組色（深色主題要亮一點）"""
+        palette = shared_group_colours(theme_key)
+        if palette == self._palette:
+            return
+        self._palette = palette
+        self._assign_group_colours()
+        self.refresh_all()
+
+    def _assign_group_colours(self) -> None:
+        """
+        依「顯示順序」給每個共用群一個顏色。
+
+        清單已經把同一群排在一起，所以照順序輪替就保證相鄰的兩群不同色——
+        全部用同一個藍色的話，「5 份共用」與「3 份共用」排在一起會分不出界線。
+        只有一份的專案不進這張表（不上色）。
+        """
+        self._clusters = cluster_projects(self._projects)
+        sizes: dict[int, int] = {}
+        for cluster_id in self._clusters.values():
+            sizes[cluster_id] = sizes.get(cluster_id, 0) + 1
+
+        self._group_colours = {}
+        index = 0
+        for project in self._visible:
+            cluster_id = self._clusters.get(id(project))
+            if cluster_id is None or sizes.get(cluster_id, 0) < 2:
+                continue
+            if cluster_id in self._group_colours:
+                continue
+            self._group_colours[cluster_id] = self._palette[index % len(self._palette)]
+            index += 1
+
+    def group_colour(self, project: SpineProject) -> str | None:
+        """這份專案所屬共用群的顏色；沒共用時回傳 None（維持一般文字色）"""
+        cluster_id = self._clusters.get(id(project))
+        return self._group_colours.get(cluster_id) if cluster_id is not None else None
+
     def _recount_pages(self) -> None:
         """重算每張貼圖被幾份專案用到（共用標示與分群的依據）"""
         self._page_users = {}
@@ -125,6 +166,8 @@ class ProjectList(QTableWidget):
         current = None if select_first else self.current_project()
 
         self._visible = self._criteria.apply(self._projects)
+        # 顏色依顯示順序輪替，所以要在排序之後、填列之前算
+        self._assign_group_colours()
 
         # 重建期間擋掉選取變更訊號，否則每寫一列就會觸發一次中間面板重載
         self.blockSignals(True)
@@ -182,8 +225,9 @@ class ProjectList(QTableWidget):
         """
         合圖欄：貼圖檔名 + 共用份數 + 是否有自訂版面。
 
-        共用的合圖用藍字標出來——這一欄的存在就是為了讓「同一張圖被三個
-        skel 用」在清單上一眼看得到，而不是等到輸出壞了才發現。
+        共用的合圖依「群」上色（同群同色、相鄰群不同色），沒共用的維持
+        一般文字色。這一欄的存在就是為了讓「同一張圖被幾個 skel 用」在清單上
+        一眼看得到，而不是等到輸出壞了才發現。
         """
         paths = project.page_paths
         if not paths:
@@ -202,8 +246,9 @@ class ProjectList(QTableWidget):
             text = f"✎ {text}"
 
         item = QTableWidgetItem(text)
-        if shared > 1:
-            item.setForeground(QColor(_SHARED_COLOUR))
+        colour = self.group_colour(project)
+        if colour is not None:
+            item.setForeground(QColor(colour))
 
         lines = []
         for path in paths:
@@ -217,6 +262,7 @@ class ProjectList(QTableWidget):
         if shared > 1:
             lines.append("")
             lines.append("共用貼圖請用「合圖編輯」一起調整，避免只改到其中一份")
+            lines.append("（同色的列＝同一組共用貼圖，一起編輯）")
         item.setToolTip("\n".join(lines))
         return item
 

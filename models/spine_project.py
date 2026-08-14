@@ -30,6 +30,9 @@ class SpineProject:
     status_detail: str = ""
     # 套用後由 PreviewWorker / EstimateWorker 算出的處理後容量預估
     size_estimate: SizeEstimate | None = None
+    # 這份專案有幾張貼圖使用自訂合圖版面（由主視窗同步；影響狀態文字，
+    # 因為有版面的頁面不吃 applied_options 的縮放比例）
+    custom_sheets: int = 0
 
     @property
     def name(self) -> str:
@@ -142,9 +145,14 @@ class SpineProject:
             return f"失敗：{self.status_detail[:30]}" if self.status_detail else "失敗"
         if self.status == STATUS_APPLIED and self.applied_options is not None:
             options = self.applied_options
+            # 全部頁面都有自訂版面時，比例根本沒生效，寫出來會誤導
+            all_custom = self.custom_sheets >= len(self.page_paths) > 0
+            if all_custom:
+                return "已套用（自訂合圖）"
+            suffix = " ＋合圖" if self.custom_sheets else ""
             if not options.resize_enabled:
-                return "已套用（只壓縮）"
-            return f"已套用 {options.scale_percent:g}%"
+                return f"已套用（只壓縮）{suffix}"
+            return f"已套用 {options.scale_percent:g}%{suffix}"
         if not self.can_process:
             return self.warnings[0][:36] if self.warnings else "無法處理"
         return "未套用"

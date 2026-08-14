@@ -379,7 +379,8 @@ class SettingsPanel(QScrollArea):
         self.resize_card = card
 
         self.resize_enabled_check = QCheckBox("啟用 Resize")
-        self.resize_enabled_check.setChecked(True)
+        # 預設關閉：縮小貼圖不可逆，要縮就得是明確的選擇
+        self.resize_enabled_check.setChecked(False)
         self.resize_enabled_check.setToolTip("關閉時比例固定 100%，只做壓縮不縮放")
         layout.addWidget(self.resize_enabled_check)
 

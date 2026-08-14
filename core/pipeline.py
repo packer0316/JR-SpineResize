@@ -98,9 +98,6 @@ class AssetResult:
 @dataclass
 class BatchResult:
     results: list[AssetResult] = field(default_factory=list)
-    # 啟用「匯出處理紀錄」時實際寫出的 log 路徑，以及寫出失敗的原因
-    log_path: Path | None = None
-    log_error: str = ""
 
     @property
     def succeeded(self) -> list[AssetResult]:
@@ -210,21 +207,73 @@ def _flush_writes(pending_writes: list[tuple[Path, bytes | Path]]) -> None:
             dst_path.write_bytes(payload)
 
 
+# ---------------------------------------------------------------- 共用貼圖
+
+
+@dataclass
+class RenderedPage:
+    """
+    本批次已經產生過的貼圖。
+
+    多個 atlas 指向同一張貼圖很常見（實測素材裡有三個 atlas 共用一張 png），
+    第二份之後就沿用這筆紀錄：不重新渲染，也不再檢查來源尺寸——
+    覆蓋模式下來源已經是我們自己縮好的圖，再檢查一定不符。
+    """
+
+    src_path: Path
+    canvas: tuple[int, int]
+    # (區塊名稱, 目標矩形) 集合；用來確認這張圖真的容得下另一份 atlas 的所有區塊
+    region_keys: set[tuple[str, tuple[int, int, int, int]]]
+    src_bytes: int
+    dst_bytes: int
+    source_mode: str
+    encoding: str
+    owner: str  # 第一個產生它的 atlas 檔名（訊息用）
+
+
+def _region_keys(mapping) -> set[tuple[str, tuple[int, int, int, int]]]:
+    return {(item.region.name, item.dst_rect) for item in mapping.regions}
+
+
+def _reuse_blocker(record: RenderedPage, src_path: Path, canvas: tuple[int, int], mapping) -> str:
+    """回傳不能沿用的原因；空字串表示可以沿用。"""
+    if record.src_path != src_path.resolve():
+        return (
+            f"另一份 atlas（{record.owner}）已經輸出到同一個檔名，但來源貼圖不同，"
+            "請改用不同的檔名後綴或輸出資料夾"
+        )
+    if record.canvas != canvas:
+        return (
+            f"與 {record.owner} 共用同一張貼圖，但它算出的頁面尺寸是 "
+            f"{record.canvas[0]}x{record.canvas[1]}，本份需要 {canvas[0]}x{canvas[1]}"
+        )
+    missing = sorted(
+        name for name, rect in _region_keys(mapping) if (name, rect) not in record.region_keys
+    )
+    if missing:
+        shown = "、".join(missing[:5]) + (" …" if len(missing) > 5 else "")
+        return (
+            f"與 {record.owner} 共用同一張貼圖，但這份 atlas 的區塊版面不同"
+            f"（{len(missing)} 個區塊對不上：{shown}）"
+        )
+    return ""
+
+
 # ---------------------------------------------------------------- 主流程
 
 
 def process_asset(
     asset: SpineAsset,
     options: ProcessOptions,
-    rendered_pages: dict[Path, tuple[Path, int]] | None = None,
+    rendered_pages: dict[Path, RenderedPage] | None = None,
     progress: ProgressCallback | None = None,
 ) -> AssetResult:
     """
     處理單一 Spine 資產。
 
-    ``rendered_pages`` 記錄同一批次內已經產生過的貼圖（輸出路徑 -> 來源與版面指紋）。
+    ``rendered_pages`` 記錄同一批次內已經產生過的貼圖（輸出路徑 -> RenderedPage）。
     多個 atlas 共用同一張貼圖是常見作法（實測素材中就有三個 atlas 指向同一張 png），
-    這個表可以避免重複渲染，也能在「共用貼圖但版面不同」時提出警告。
+    第二份之後直接沿用，不重複渲染，也不會因為「來源已經被自己縮過」而誤判失敗。
     """
     started = time.perf_counter()
     result = AssetResult(asset=asset)
@@ -263,6 +312,7 @@ def process_asset(
     # 貼圖先壓縮進記憶體，等整份資產驗證通過才落地——
     # 覆蓋模式不做備份，先寫再驗證失敗會毀掉原檔
     pending_writes: list[tuple[Path, bytes | Path]] = []
+    fresh_pages: dict[Path, RenderedPage] = {}
 
     for page in atlas.pages:
         src_path = asset.pages[page.name]
@@ -280,6 +330,8 @@ def process_asset(
                 rendered_pages=rendered_pages,
                 atlas=atlas,
                 pending_writes=pending_writes,
+                fresh_pages=fresh_pages,
+                owner=asset.atlas_path.name,
             )
         except (PageImageError, ProcessError) as exc:
             result.report.add(LEVEL_ERROR, f"[{page.name}] {exc}")
@@ -305,6 +357,8 @@ def process_asset(
 
     # ---- 驗證通過，貼圖與 atlas 一起落地（覆蓋模式直接改寫原檔）--------
     _flush_writes(pending_writes)
+    # 檔案真的寫出去了，才讓後面共用同一張貼圖的 atlas 沿用
+    rendered_pages.update(fresh_pages)
     atlas_name = _output_name(asset.atlas_path.name, options.filename_suffix)
     atlas_out = out_dir / atlas_name
     write_atlas_file(atlas, atlas_out)
@@ -328,9 +382,11 @@ def _process_page(
     options: ProcessOptions,
     settings: RenderSettings,
     report: ValidationReport,
-    rendered_pages: dict[Path, Path],
+    rendered_pages: dict[Path, RenderedPage],
     atlas,
     pending_writes: list[tuple[Path, bytes | Path]],
+    fresh_pages: dict[Path, RenderedPage],
+    owner: str,
 ) -> PageOutput | None:
     """處理單一頁面：算出縮放比例、產生新貼圖、把座標寫回 atlas。"""
     declared = page.size
@@ -338,6 +394,41 @@ def _process_page(
     dst_path = out_dir / dst_name
 
     if options.mode == MODE_RESCALE:
+        scale = options.scale
+        canvas = (
+            max(1, align_up(round_half_up(declared[0] * scale), options.page_align)),
+            max(1, align_up(round_half_up(declared[1] * scale), options.page_align)),
+        )
+        mapping = build_page_mapping(page, scale, scale, canvas)
+
+        # 先看這張貼圖本批次是不是已經產生過（多個 atlas 共用一張圖）。
+        # 這個判斷必須在讀圖之前：覆蓋模式下來源已被我們改成縮好的圖，
+        # 若先去檢查「宣告尺寸 vs 實際尺寸」一定會誤判成二次縮放而失敗。
+        record = rendered_pages.get(dst_path.resolve())
+        if record is not None:
+            blocker = _reuse_blocker(record, src_path, canvas, mapping)
+            if blocker:
+                report.add(LEVEL_ERROR, f"[{page.name}] {blocker}")
+                return None
+            report.add(
+                LEVEL_INFO,
+                f"[{page.name}] 與 {record.owner} 共用同一張貼圖，沿用本批次已產生的結果",
+            )
+            report.extend(validate_page(mapping, canvas))
+            apply_page_mapping(mapping)
+            return PageOutput(
+                page_name=page.name,
+                src_path=src_path,
+                dst_path=dst_path,
+                src_size=declared,
+                dst_size=canvas,
+                src_bytes=record.src_bytes,
+                dst_bytes=record.dst_bytes,
+                reused=True,
+                source_mode=record.source_mode,
+                encoding="共用（已產生）",
+            )
+
         try:
             with Image.open(src_path) as image:
                 actual = image.size
@@ -354,40 +445,30 @@ def _process_page(
             report.extend(source_check)
             return None
 
-        scale = options.scale
-        canvas = (
-            max(1, align_up(round_half_up(declared[0] * scale), options.page_align)),
-            max(1, align_up(round_half_up(declared[1] * scale), options.page_align)),
+        src_bytes = src_path.stat().st_size
+        render = render_page(source, mapping, settings)
+        for note in render.notes:
+            report.add(LEVEL_INFO, f"[{page.name}] {note}")
+        payload, encoding, dst_bytes = _encode_texture(
+            render.image,
+            dst_path,
+            src_path,
+            scale,
+            options.compression,
         )
-        mapping = build_page_mapping(page, scale, scale, canvas)
-
-        fingerprint = _layout_fingerprint(mapping)
-        cached = rendered_pages.get(dst_path.resolve())
-        encoding = ""
-        if cached is not None and cached == (src_path.resolve(), fingerprint):
-            reused = True  # 同一批次已經產生過完全相同的貼圖，直接沿用
-            encoding = "共用（已產生）"
-            dst_bytes = dst_path.stat().st_size if dst_path.exists() else 0
-        else:
-            if cached is not None:
-                report.add(
-                    LEVEL_WARNING,
-                    f"[{page.name}] 另一份 atlas 也輸出到同一張貼圖，但區塊版面不同，"
-                    "後處理的會覆蓋先前的結果，請確認這些 atlas 是否真的共用同一張圖",
-                )
-            render = render_page(source, mapping, settings)
-            for note in render.notes:
-                report.add(LEVEL_INFO, f"[{page.name}] {note}")
-            payload, encoding, dst_bytes = _encode_texture(
-                render.image,
-                dst_path,
-                src_path,
-                scale,
-                options.compression,
-            )
-            pending_writes.append((dst_path, payload))
-            rendered_pages[dst_path.resolve()] = (src_path.resolve(), fingerprint)
-            reused = False
+        pending_writes.append((dst_path, payload))
+        # 只先記在本份資產的暫存表；等驗證通過、檔案真的寫出去了才併進批次共用表，
+        # 否則後面共用同一張圖的 atlas 會沿用一個根本沒被寫出的結果
+        fresh_pages[dst_path.resolve()] = RenderedPage(
+            src_path=src_path.resolve(),
+            canvas=canvas,
+            region_keys=_region_keys(mapping),
+            src_bytes=src_bytes,
+            dst_bytes=dst_bytes,
+            source_mode=source_mode,
+            encoding=encoding,
+            owner=owner,
+        )
 
         report.extend(validate_page(mapping, canvas))
         apply_page_mapping(mapping)
@@ -398,9 +479,9 @@ def _process_page(
             dst_path=dst_path,
             src_size=declared,
             dst_size=canvas,
-            src_bytes=src_path.stat().st_size,
+            src_bytes=src_bytes,
             dst_bytes=dst_bytes,
-            reused=reused,
+            reused=False,
             source_mode=source_mode,
             encoding=encoding,
         )
@@ -449,15 +530,6 @@ def _process_page(
         dst_size=actual,
         src_bytes=src_path.stat().st_size if src_path.exists() else 0,
         dst_bytes=scaled_path.stat().st_size,
-    )
-
-
-def _layout_fingerprint(mapping) -> int:
-    """區塊版面的指紋，用來判斷兩份 atlas 是否真的會產生同一張貼圖。"""
-    return hash(
-        tuple(
-            (item.region.name, item.src_rect, item.dst_rect) for item in mapping.regions
-        )
     )
 
 
@@ -581,7 +653,7 @@ def process_batch(
 ) -> BatchResult:
     """批次處理。同一批次內共用貼圖的 atlas 只會渲染一次。"""
     batch = BatchResult()
-    rendered_pages: dict[Path, tuple[Path, int]] = {}
+    rendered_pages: dict[Path, RenderedPage] = {}
     total = len(assets)
 
     for index, asset in enumerate(assets):

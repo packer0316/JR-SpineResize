@@ -164,6 +164,12 @@ QPushButton[chip="true"]:hover {{
     color: #FFFFFF;
     border-color: {p.primary};
 }}
+/* 篩選鈕展開時保持高亮，讓人一眼看出面板是開著的 */
+QPushButton[chip="true"]:checked {{
+    background-color: {p.primary};
+    color: #FFFFFF;
+    border-color: {p.primary};
+}}
 
 /* ===== GroupBox 卡片 ===== */
 QGroupBox {{

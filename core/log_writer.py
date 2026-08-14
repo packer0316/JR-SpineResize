@@ -1,162 +1,257 @@
 """
-處理紀錄（log）匯出
+設定紀錄匯出
 
-把一次批次處理的每一筆改動寫成純文字紀錄：貼圖檔名、來源與輸出的絕對路徑、
-尺寸與容量的變化幅度、實際使用的編碼，以及未通過的驗證訊息。
+把「目前已套用設定」的專案寫成一份純文字紀錄：每一組設定的完整內容、
+套用到哪些專案，以及每張貼圖的絕對路徑、尺寸與容量的預估變化。
 
-不相依 Qt，可在背景執行緒或批次腳本中直接呼叫。
+設定相同的專案會歸成同一組（套用到全部時最常見），不會把同一份設定重印幾十次。
+不相依 Qt，可在批次腳本中直接呼叫。
 """
 from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
 
+from config.constants import (
+    ALPHA_MODE_PREMULTIPLY,
+    BLEED_NONE,
+    COMPRESSION_EFFORTS,
+    MODE_RESCALE,
+    OUTPUT_CUSTOM,
+    OUTPUT_INPLACE,
+    OUTPUT_SUBFOLDER,
+    PAGE_ALIGN_4,
+    PAGE_ALIGN_POT,
+    PNG_COLOR_FORMATS,
+    PNG_MODES,
+    RESAMPLE_FILTERS,
+)
 from config.version import VERSION
-from core.pipeline import AssetResult, BatchResult
+from models.compression_options import PngColorFormat, PngMode
+from models.process_options import ProcessOptions
+from models.size_estimate import aggregate_estimates
+from models.spine_project import SpineProject
 from utils.file_utils import format_bytes
 
 _SEPARATOR = "=" * 78
+_NONE = "（無）"
 
 
 def log_filename(stamp: datetime | None = None) -> str:
     stamp = stamp or datetime.now()
-    return f"JR-SpineResize_log_{stamp:%Y%m%d-%H%M%S}.txt"
+    return f"JR-SpineResize_設定紀錄_{stamp:%Y%m%d-%H%M%S}.txt"
 
 
 def _pct(before: int, after: int) -> str:
-    """容量或面積的增減幅度"""
     if before <= 0:
         return "—"
     ratio = after / before
     return f"縮小 {1 - ratio:.1%}" if ratio <= 1 else f"增加 {ratio - 1:.1%}"
 
 
-def _size_block(page) -> list[str]:
-    src_w, src_h = page.src_size
-    dst_w, dst_h = page.dst_size
-    lines = [f"        檔名: {page.page_name}"]
-    if page.src_path is not None:
-        lines.append(f"        來源: {page.src_path.resolve()}")
-    if page.dst_path is not None:
-        lines.append(f"        輸出: {page.dst_path.resolve()}")
-
-    area_before = src_w * src_h
-    area_after = dst_w * dst_h
-    edge = f"{dst_w / src_w:.1%}" if src_w else "—"
-    lines.append(
-        f"        尺寸: {src_w}x{src_h} → {dst_w}x{dst_h}"
-        f"（長寬各 {edge}、像素量 {_pct(area_before, area_after)}）"
-    )
-    lines.append(
-        f"        容量: {format_bytes(page.src_bytes)} → {format_bytes(page.dst_bytes)}"
-        f"（{_pct(page.src_bytes, page.dst_bytes)}）"
-    )
-    lines.append(f"        編碼: {page.encoding or '—'}")
-    if page.reused:
-        lines.append("        備註: 與其他 atlas 共用，本批次只產生一次")
-    return lines
+def _align_text(value: int) -> str:
+    if value == PAGE_ALIGN_4:
+        return "補到 4 的倍數"
+    if value == PAGE_ALIGN_POT:
+        return "補到 2 的次方"
+    return "不變（等比縮放）"
 
 
-def _asset_block(index: int, result: AssetResult) -> list[str]:
-    report = result.report
-    if result.error:
-        status = f"失敗：{result.error}"
-    elif report.errors:
-        status = f"未輸出（{len(report.errors)} 項錯誤）"
-    elif report.warnings:
-        status = f"完成（{len(report.warnings)} 項警告）"
-    else:
-        status = "完成"
+def _output_text(options: ProcessOptions) -> str:
+    if options.output_mode == OUTPUT_INPLACE:
+        return "覆蓋原檔（不建立備份）"
+    if options.output_mode == OUTPUT_SUBFOLDER:
+        return f"輸出到子資料夾「{options.subfolder_name}」"
+    if options.output_mode == OUTPUT_CUSTOM:
+        return f"輸出到指定路徑：{options.output_dir or _NONE}"
+    return options.output_mode
 
+
+def describe_options(options: ProcessOptions) -> list[str]:
+    """把一組設定攤成人看得懂的條列（欄位順序對應介面卡片）"""
+    compression = options.compression
     lines = [
-        "",
-        _SEPARATOR,
-        f"[{index}] {result.asset.name}　—　{status}",
-        f"    atlas 來源: {result.asset.atlas_path.resolve()}",
+        f"處理模式　　: {'縮放貼圖並重寫 atlas' if options.mode == MODE_RESCALE else '只重算 atlas（貼圖已在外部縮好）'}",
     ]
-    if result.atlas_out is not None:
-        lines.append(f"    atlas 輸出: {result.atlas_out.resolve()}")
-    if result.asset.skeleton_path is not None:
-        note = "（原樣複製）" if result.skeleton_out is not None else "（未複製）"
-        lines.append(f"    骨架檔　　: {result.asset.skeleton_path.resolve()} {note}")
-    if report.total_regions:
+
+    if options.mode == MODE_RESCALE:
+        if options.resize_enabled:
+            lines.append(
+                f"尺寸調整　　: 啟用，按百分比 {options.scale_percent:g}%"
+                f"（插值 {RESAMPLE_FILTERS.get(options.resample, options.resample)}）"
+            )
+        else:
+            lines.append("尺寸調整　　: 關閉（只壓縮，尺寸不變）")
+
         lines.append(
-            f"    區塊: {report.total_regions} 個，座標完全精確 {report.exact_regions} 個，"
-            f"最大幾何偏移 {report.max_drift_px:.2f} 原始像素"
+            f"壓縮 - 模式　: {PNG_MODES.get(compression.png_mode.value, compression.png_mode.value)}"
         )
-    lines.append(f"    耗時: {result.elapsed:.2f} 秒")
+        if compression.png_mode == PngMode.LOSSY:
+            lines.append(f"　　品質　　　: {compression.png_quality}")
+            lines.append(f"　　漸層抖動　: {compression.png_dithering * 100:.0f}")
+        lines.append(
+            "壓縮 - 色彩格式: "
+            + PNG_COLOR_FORMATS.get(
+                compression.png_color_format.value, compression.png_color_format.value
+            )
+        )
+        if compression.png_color_format != PngColorFormat.RGBA8888:
+            lines.append(f"　　量化抖動　: {'開啟' if compression.png_format_dither else '關閉'}")
+        lines.append(
+            "壓縮 - 最佳化強度: "
+            + COMPRESSION_EFFORTS.get(compression.effort.value, compression.effort.value)
+        )
+        lines.append(f"移除中繼資料: {'是' if compression.remove_exif else '否'}")
+        lines.append(
+            "目標檔案大小: "
+            + (f"{compression.target_size_kb} KB" if compression.target_size_enabled else "未啟用")
+        )
 
-    for page_index, page in enumerate(result.pages, start=1):
-        lines.append(f"    貼圖 {page_index}/{len(result.pages)}:")
-        lines.extend(_size_block(page))
+        lines.append(
+            f"透明處理　　: {'預乘後縮放' if options.alpha_mode == ALPHA_MODE_PREMULTIPLY else '直接縮放'}"
+        )
+        bleed = {
+            "rgb": "滲出顏色",
+            "full": "連 alpha 一起外擴",
+            BLEED_NONE: "不處理",
+        }.get(options.bleed, options.bleed)
+        bleed_text = bleed if options.bleed == BLEED_NONE else f"{bleed} {options.bleed_px} px"
+        lines.append(f"邊緣填充　　: {bleed_text}")
+        lines.append(f"畫布對齊　　: {_align_text(options.page_align)}")
+    else:
+        lines.append(f"已縮好的貼圖: {options.prescaled_dir or '與 atlas 同一層'}")
+        lines.append(
+            f"縮放比例來源: {'由貼圖實際尺寸推算' if options.derive_scale_from_image else f'指定 {options.scale_percent:g}%'}"
+        )
 
-    issues = report.sorted_issues()
-    if issues:
-        lines.append("    驗證訊息:")
-        for issue in issues:
-            lines.append(f"        {issue.icon} {issue.message}")
+    lines.append(f"輸出　　　　: {_output_text(options)}")
+    lines.append(f"檔名後綴　　: {options.filename_suffix or _NONE}")
+    lines.append(f"複製骨架檔　: {'是' if options.copy_skeleton else '否'}")
     return lines
 
 
-def build_log_text(
-    batch: BatchResult,
-    skipped: list[str] | None = None,
+def _project_block(index: int, project: SpineProject) -> list[str]:
+    lines = [f"  [{index}] {project.name}"]
+    if project.skeleton_path is not None:
+        version = f"（Spine {project.spine_version}）" if project.spine_version else ""
+        lines.append(f"      骨架 : {project.skeleton_path.resolve()}{version}")
+    for asset in project.atlases:
+        detail = f"（{asset.region_count} 區塊）" if asset.atlas else "（無法解析）"
+        lines.append(f"      atlas: {asset.atlas_path.resolve()}{detail}")
+
+    estimate = project.size_estimate
+    seen: set[Path] = set()
+    for asset in project.atlases:
+        for page_name, path in asset.pages.items():
+            if path is None:
+                lines.append(f"      貼圖 : {page_name} —— 找不到檔案")
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            lines.append(f"      貼圖 : {path.name}")
+            lines.append(f"             路徑: {resolved}")
+            page = estimate.page(path.name) if estimate is not None else None
+            if page is not None:
+                src_w, src_h = page.src_size
+                dst_w, dst_h = page.dst_size
+                edge = f"{dst_w / src_w:.1%}" if src_w else "—"
+                lines.append(
+                    f"             尺寸: {src_w}x{src_h} → {dst_w}x{dst_h}（長寬各 {edge}）"
+                )
+                lines.append(
+                    f"             容量: {format_bytes(page.src_bytes)} → 預估 "
+                    f"{format_bytes(page.est_bytes)}（{_pct(page.src_bytes, page.est_bytes)}）"
+                )
+            else:
+                try:
+                    lines.append(f"             容量: {format_bytes(path.stat().st_size)}（尚未估算）")
+                except OSError:
+                    pass
+    return lines
+
+
+def build_settings_log(
+    projects: list[SpineProject],
+    total_count: int | None = None,
     stamp: datetime | None = None,
 ) -> str:
+    """
+    產生設定紀錄文字。
+
+    Args:
+        projects: 已套用設定的專案
+        total_count: 清單中的專案總數（用來標示有多少份未套用）
+        stamp: 產生時間
+    """
     stamp = stamp or datetime.now()
-    ok = len(batch.succeeded)
-    failed = len(batch.failed)
-    total_pages = sum(len(r.pages) for r in batch.results)
+    applied = [p for p in projects if p.applied_options is not None]
 
     lines = [
-        f"JR-SpineResize {VERSION} 處理紀錄",
+        f"JR-SpineResize {VERSION} 設定紀錄",
         f"產生時間: {stamp:%Y-%m-%d %H:%M:%S}",
         "",
-        f"資產: 完成 {ok} 份" + (f"、失敗 {failed} 份" if failed else ""),
-        f"貼圖: {total_pages} 張",
     ]
-    if batch.src_bytes:
+    if total_count is not None and total_count > len(applied):
+        lines.append(f"已套用設定: {len(applied)} 份（清單共 {total_count} 份，其餘未套用）")
+    else:
+        lines.append(f"已套用設定: {len(applied)} 份")
+
+    estimates = [p.size_estimate for p in applied if p.size_estimate is not None]
+    if estimates:
+        src_total, est_total = aggregate_estimates(estimates)
+        pending = len(applied) - len(estimates)
+        note = f"，另 {pending} 份尚未估算" if pending else ""
         lines.append(
-            f"容量: {format_bytes(batch.src_bytes)} → {format_bytes(batch.dst_bytes)}"
-            f"（{_pct(batch.src_bytes, batch.dst_bytes)}）"
+            f"預估容量　: {format_bytes(src_total)} → {format_bytes(est_total)}"
+            f"（{_pct(src_total, est_total)}）{note}"
         )
-    if skipped:
-        lines.append(f"略過（未套用設定）: {len(skipped)} 份 — {'、'.join(skipped)}")
+        lines.append("　　　　　　（共用貼圖只計一次，與實際寫出的檔案量一致）")
 
-    for index, result in enumerate(batch.results, start=1):
-        lines.extend(_asset_block(index, result))
+    if not applied:
+        lines.append("")
+        lines.append("沒有任何專案已套用設定。")
+        lines.append("")
+        return "\n".join(lines)
 
-    lines.append("")
+    # 設定相同的專案歸成一組：套用到全部時不必把同一份設定重印幾十次
+    groups: list[tuple[ProcessOptions, list[SpineProject]]] = []
+    for project in applied:
+        options = project.applied_options
+        assert options is not None
+        key = describe_options(options)
+        for existing_options, members in groups:
+            if describe_options(existing_options) == key:
+                members.append(project)
+                break
+        else:
+            groups.append((options, [project]))
+
+    for group_index, (options, members) in enumerate(groups, start=1):
+        lines.append("")
+        lines.append(_SEPARATOR)
+        title = f"設定 {group_index}" if len(groups) > 1 else "設定"
+        lines.append(f"{title}　—　套用於 {len(members)} 份專案")
+        lines.append(_SEPARATOR)
+        lines.extend(describe_options(options))
+        lines.append("")
+        lines.append(f"套用的專案（{len(members)} 份）:")
+        for index, project in enumerate(members, start=1):
+            lines.extend(_project_block(index, project))
+            lines.append("")
+
     return "\n".join(lines)
 
 
-def resolve_log_dir(batch: BatchResult) -> Path | None:
-    """紀錄檔要放的資料夾：第一份有輸出的資產所在位置"""
-    for result in batch.results:
-        if result.atlas_out is not None:
-            return result.atlas_out.parent
-    for result in batch.results:
-        for page in result.pages:
-            if page.dst_path is not None:
-                return page.dst_path.parent
-    # 全部失敗時退回第一份資產的來源資料夾
-    if batch.results:
-        return batch.results[0].asset.folder
-    return None
-
-
-def write_process_log(
-    batch: BatchResult,
-    skipped: list[str] | None = None,
-    directory: Path | None = None,
-) -> Path | None:
-    """寫出紀錄檔，回傳實際路徑（無處可寫時回傳 None）。"""
-    target_dir = directory or resolve_log_dir(batch)
-    if target_dir is None:
-        return None
+def write_settings_log(
+    projects: list[SpineProject],
+    path: Path,
+    total_count: int | None = None,
+) -> Path:
+    """寫出設定紀錄，回傳實際路徑。"""
     stamp = datetime.now()
-    path = target_dir / log_filename(stamp)
     path.parent.mkdir(parents=True, exist_ok=True)
     # utf-8-sig：Windows 上用記事本或 Excel 開啟時中文才不會變亂碼
-    path.write_text(build_log_text(batch, skipped, stamp), encoding="utf-8-sig")
+    path.write_text(build_settings_log(projects, total_count, stamp), encoding="utf-8-sig")
     return path

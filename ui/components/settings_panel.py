@@ -510,12 +510,6 @@ class SettingsPanel(QScrollArea):
             _hint("骨架檔只會被原樣複製，內容絕不修改——等比縮貼圖時骨架本來就不該改動。")
         )
 
-        self.export_log_check = QCheckBox("匯出處理紀錄（log）")
-        self.export_log_check.setToolTip(
-            "在輸出資料夾產生一份文字紀錄，逐筆記下每張貼圖的\n"
-            "檔名、來源與輸出的絕對路徑、尺寸與容量各縮小了幾 %"
-        )
-        layout.addWidget(self.export_log_check)
         return card
 
     def _browse_output(self) -> None:
@@ -553,7 +547,6 @@ class SettingsPanel(QScrollArea):
             self.resize_enabled_check,
             self.derive_check,
             self.copy_skeleton_check,
-            self.export_log_check,
         ):
             check.toggled.connect(self._on_changed)
         for slider in (self.png_quality_slider, self.png_dither_slider):
@@ -647,7 +640,6 @@ class SettingsPanel(QScrollArea):
             subfolder_name=self.subfolder_edit.text().strip() or "resized",
             filename_suffix=self.suffix_edit.text().strip(),
             copy_skeleton=self.copy_skeleton_check.isChecked(),
-            export_log=self.export_log_check.isChecked(),
         )
 
     def set_options(self, options: ProcessOptions) -> None:
@@ -683,7 +675,6 @@ class SettingsPanel(QScrollArea):
             self.subfolder_edit.setText(options.subfolder_name)
             self.suffix_edit.setText(options.filename_suffix)
             self.copy_skeleton_check.setChecked(options.copy_skeleton)
-            self.export_log_check.setChecked(options.export_log)
         finally:
             for widget, blocked in zip(self._all_inputs(), blockers):
                 widget.blockSignals(blocked)
@@ -719,7 +710,6 @@ class SettingsPanel(QScrollArea):
             self.subfolder_edit,
             self.suffix_edit,
             self.copy_skeleton_check,
-            self.export_log_check,
         ]
 
     @staticmethod

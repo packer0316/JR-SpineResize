@@ -58,7 +58,6 @@ def load_options() -> ProcessOptions:
         subfolder_name=s.value("output/subfolder", DEFAULT_SUBFOLDER_NAME, type=str),
         filename_suffix=s.value("output/suffix", "", type=str),
         copy_skeleton=s.value("output/copy_skeleton", True, type=bool),
-        export_log=s.value("output/export_log", False, type=bool),
     )
 
 
@@ -80,7 +79,6 @@ def save_options(options: ProcessOptions) -> None:
     s.setValue("output/subfolder", options.subfolder_name)
     s.setValue("output/suffix", options.filename_suffix)
     s.setValue("output/copy_skeleton", options.copy_skeleton)
-    s.setValue("output/export_log", options.export_log)
 
 
 def load_window_geometry() -> bytes | None:

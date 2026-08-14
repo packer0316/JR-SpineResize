@@ -49,9 +49,6 @@ class ReportDialog(QDialog):
             skipped_label.setWordWrap(True)
             layout.addWidget(skipped_label)
         layout.addWidget(self._build_table(), 3)
-        log_label = self._build_log_label()
-        if log_label is not None:
-            layout.addWidget(log_label)
         layout.addWidget(QLabel("訊息"))
         layout.addWidget(self._build_messages(), 2)
         layout.addLayout(self._build_buttons())
@@ -136,20 +133,6 @@ class ReportDialog(QDialog):
 
         return table
 
-    def _build_log_label(self) -> QLabel | None:
-        batch = self._batch
-        if batch.log_error:
-            label = QLabel(f"處理紀錄寫出失敗：{batch.log_error}")
-            label.setStyleSheet("color: #dc2626;")
-        elif batch.log_path is not None:
-            label = QLabel(f"處理紀錄：{batch.log_path}")
-            label.setProperty("role", "hint")
-        else:
-            return None
-        label.setWordWrap(True)
-        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        return label
-
     def _build_messages(self) -> QTextEdit:
         view = QTextEdit()
         view.setReadOnly(True)
@@ -175,15 +158,6 @@ class ReportDialog(QDialog):
         open_button.clicked.connect(self._open_output)
         open_button.setEnabled(any(r.atlas_out for r in self._batch.results))
         row.addWidget(open_button)
-
-        if self._batch.log_path is not None:
-            log_button = QPushButton("開啟處理紀錄")
-            log_button.clicked.connect(
-                lambda: QDesktopServices.openUrl(
-                    QUrl.fromLocalFile(str(self._batch.log_path))
-                )
-            )
-            row.addWidget(log_button)
         row.addStretch(1)
         close = QPushButton("關閉")
         close.setProperty("role", "primary")

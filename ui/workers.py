@@ -6,8 +6,7 @@ from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from config.constants import MODE_RESCALE
-from core.log_writer import write_process_log
-from core.pipeline import BatchResult, build_preview, process_asset
+from core.pipeline import BatchResult, RenderedPage, build_preview, process_asset
 from core.project_scanner import scan_projects
 from core.spine.texture_store import AtlasTextureStore
 from models.process_options import ProcessOptions
@@ -44,7 +43,7 @@ class ProcessWorker(QThread):
 
     def run(self) -> None:
         batch = BatchResult()
-        rendered_pages: dict[Path, tuple[Path, int]] = {}
+        rendered_pages: dict[Path, RenderedPage] = {}
         todo = [p for p in self._projects if p.applied_options is not None and p.can_process]
         skipped = [p.name for p in self._projects if p.applied_options is None]
         total = len(todo)
@@ -75,14 +74,6 @@ class ProcessWorker(QThread):
             project.status = STATUS_DONE if ok else STATUS_FAILED
             project.status_detail = detail
             self.project_done.emit(project)
-
-        if batch.results and any(p.applied_options.export_log for p in todo):
-            self.progress.emit(total, total, "寫出處理紀錄…")
-            try:
-                batch.log_path = write_process_log(batch, skipped)
-            except OSError as exc:
-                # 紀錄寫不出來不該讓整批處理看起來失敗，只在報告裡說明
-                batch.log_error = str(exc)
 
         self.progress.emit(total, total, "完成")
         self.finished_process.emit(batch, skipped)

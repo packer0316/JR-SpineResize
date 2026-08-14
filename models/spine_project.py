@@ -83,6 +83,32 @@ class SpineProject:
         return " / ".join(p for p in parts if p)
 
     @property
+    def page_sizes(self) -> list[tuple[int, int]]:
+        """所有 atlas 頁面的宣告尺寸"""
+        return [
+            page.size
+            for asset in self.atlases
+            if asset.atlas
+            for page in asset.atlas.pages
+        ]
+
+    @property
+    def max_page_edge(self) -> int:
+        """最大的頁面邊長（篩選與排序用）"""
+        edges = [edge for size in self.page_sizes for edge in size]
+        return max(edges, default=0)
+
+    @property
+    def pages_are_pot(self) -> bool:
+        """所有頁面的寬高都是 2 的次方（遊戲貼圖常見規格要求）"""
+        sizes = self.page_sizes
+        if not sizes:
+            return False
+        return all(
+            v > 0 and (v & (v - 1)) == 0 for size in sizes for v in size
+        )
+
+    @property
     def source_bytes(self) -> int:
         total = 0
         seen: set[Path] = set()

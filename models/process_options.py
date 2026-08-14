@@ -52,8 +52,6 @@ class ProcessOptions:
     subfolder_name: str = DEFAULT_SUBFOLDER_NAME
     filename_suffix: str = ""
     copy_skeleton: bool = True
-    # 匯出處理紀錄：每張貼圖的檔名、絕對路徑、尺寸與容量變化
-    export_log: bool = False
     # 使用者拖入的來源根目錄，用於在自訂輸出時保留相對路徑結構
     source_roots: list[Path] = field(default_factory=list)
 
@@ -62,6 +60,60 @@ class ProcessOptions:
         if not self.resize_enabled:
             return 1.0
         return self.scale_percent / 100.0
+
+    # ------------------------------------------------------------ 序列化
+
+    def to_dict(self) -> dict:
+        """供專案檔儲存（路徑一律存絕對路徑字串）"""
+        return {
+            "mode": self.mode,
+            "resize_enabled": self.resize_enabled,
+            "scale_percent": self.scale_percent,
+            "resample": self.resample,
+            "alpha_mode": self.alpha_mode,
+            "bleed": self.bleed,
+            "bleed_px": self.bleed_px,
+            "page_align": self.page_align,
+            "compression": self.compression.to_dict(),
+            "prescaled_dir": str(self.prescaled_dir.resolve()) if self.prescaled_dir else "",
+            "derive_scale_from_image": self.derive_scale_from_image,
+            "output_mode": self.output_mode,
+            "output_dir": str(self.output_dir.resolve()) if self.output_dir else "",
+            "subfolder_name": self.subfolder_name,
+            "filename_suffix": self.filename_suffix,
+            "copy_skeleton": self.copy_skeleton,
+            "source_roots": [str(Path(r).resolve()) for r in self.source_roots],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ProcessOptions":
+        """從專案檔還原（欄位缺失或損壞時退回預設值）"""
+        options = cls()
+        try:
+            options.mode = str(data.get("mode", options.mode))
+            options.resize_enabled = bool(data.get("resize_enabled", options.resize_enabled))
+            options.scale_percent = float(data.get("scale_percent", options.scale_percent))
+            options.resample = str(data.get("resample", options.resample))
+            options.alpha_mode = str(data.get("alpha_mode", options.alpha_mode))
+            options.bleed = str(data.get("bleed", options.bleed))
+            options.bleed_px = int(data.get("bleed_px", options.bleed_px))
+            options.page_align = int(data.get("page_align", options.page_align))
+            options.compression = CompressionOptions.from_dict(data.get("compression", {}))
+            prescaled = data.get("prescaled_dir", "")
+            options.prescaled_dir = Path(prescaled) if prescaled else None
+            options.derive_scale_from_image = bool(
+                data.get("derive_scale_from_image", options.derive_scale_from_image)
+            )
+            options.output_mode = str(data.get("output_mode", options.output_mode))
+            output_dir = data.get("output_dir", "")
+            options.output_dir = Path(output_dir) if output_dir else None
+            options.subfolder_name = str(data.get("subfolder_name", options.subfolder_name))
+            options.filename_suffix = str(data.get("filename_suffix", options.filename_suffix))
+            options.copy_skeleton = bool(data.get("copy_skeleton", options.copy_skeleton))
+            options.source_roots = [Path(r) for r in data.get("source_roots", []) if r]
+        except (ValueError, TypeError):
+            pass  # 損壞的欄位保持預設
+        return options
 
     def render_fingerprint(self) -> tuple:
         """會影響輸出貼圖內容的所有欄位（預覽/估算快取用）"""

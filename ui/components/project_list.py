@@ -1,16 +1,18 @@
 """Spine 專案清單（以 .skel 為單位）"""
 from __future__ import annotations
 
-from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
+    QMenu,
     QTableWidget,
     QTableWidgetItem,
 )
 
 from models.spine_project import SpineProject
+from ui.components.project_filter import FilterCriteria
 from ui.styles.theme import DELTA_DOWN_COLOUR, DELTA_UP_COLOUR
 from utils.file_utils import format_bytes, format_size_delta
 
@@ -26,18 +28,25 @@ _COL_WIDTHS = {1: 52, 2: 82, 3: 42, 4: 72, 5: 92, _COL_DELTA: 128}
 
 
 class ProjectList(QTableWidget):
-    selection_changed = pyqtSignal(object)  # SpineProject | None
+    selection_changed = pyqtSignal(object)  # 目前列的 SpineProject | None
+    remove_requested = pyqtSignal()         # 右鍵選單要求移除選取的專案
+    rows_rebuilt = pyqtSignal()             # 列已重建（載入、篩選、移除後）
 
     def __init__(self, parent=None) -> None:
         super().__init__(0, len(_COLUMNS), parent)
-        self._projects: list[SpineProject] = []
+        self._projects: list[SpineProject] = []   # 全部（不受篩選影響）
+        self._visible: list[SpineProject] = []    # 實際顯示的列，順序即排序結果
+        self._criteria = FilterCriteria()
 
         self.setHorizontalHeaderLabels(_COLUMNS)
         self.verticalHeader().setVisible(False)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # 支援 Ctrl / Shift 多選，套用與移除都能一次處理多份
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setShowGrid(False)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
 
         header = self.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -53,17 +62,66 @@ class ProjectList(QTableWidget):
 
     @property
     def projects(self) -> list[SpineProject]:
+        """全部專案（不受篩選影響）"""
         return self._projects
+
+    def visible_projects(self) -> list[SpineProject]:
+        """通過篩選、目前顯示在清單上的專案"""
+        return list(self._visible)
+
+    @property
+    def criteria(self) -> FilterCriteria:
+        return self._criteria
 
     def set_projects(self, projects: list[SpineProject]) -> None:
         self._projects = projects
-        self.setRowCount(len(projects))
-        for row, project in enumerate(projects):
-            self._fill_row(row, project)
-        if projects:
-            self.selectRow(0)
-        else:
+        self._rebuild(select_first=True)
+
+    def set_filter(self, criteria: FilterCriteria) -> None:
+        """套用新的篩選與排序，並盡量保住原本的選取"""
+        self._criteria = criteria
+        self._rebuild(select_first=False)
+
+    def _rebuild(self, select_first: bool) -> None:
+        """依目前條件重建所有列"""
+        keep = [] if select_first else self.selected_projects()
+        current = None if select_first else self.current_project()
+
+        self._visible = self._criteria.apply(self._projects)
+
+        # 重建期間擋掉選取變更訊號，否則每寫一列就會觸發一次中間面板重載
+        self.blockSignals(True)
+        try:
+            self.setRowCount(len(self._visible))
+            for row, project in enumerate(self._visible):
+                self._fill_row(row, project)
+            self.clearSelection()
+        finally:
+            self.blockSignals(False)
+
+        self.rows_rebuilt.emit()
+
+        if not self._visible:
             self.selection_changed.emit(None)
+            return
+
+        rows = [i for i, p in enumerate(self._visible) if any(p is k for k in keep)]
+        if not rows:
+            rows = [0]
+        # 先設 current（決定中間面板顯示哪一份），再補上其餘選取
+        current_row = next(
+            (i for i, p in enumerate(self._visible) if current is not None and p is current),
+            rows[0],
+        )
+        self.selectRow(current_row)
+        if len(rows) > 1:
+            model = self.selectionModel()
+            flags = (
+                model.SelectionFlag.Select | model.SelectionFlag.Rows
+            )
+            for row in rows:
+                if row != current_row:
+                    model.select(self.model().index(row, 0), flags)
 
     def _fill_row(self, row: int, project: SpineProject) -> None:
         name_item = QTableWidgetItem(project.name)
@@ -100,36 +158,81 @@ class ProjectList(QTableWidget):
         return item
 
     def _row_of(self, project: SpineProject) -> int | None:
-        """以身分（不是相等）比對——不同專案的欄位值可能完全相同"""
-        return next((i for i, p in enumerate(self._projects) if p is project), None)
+        """
+        專案對應的列號；被篩選掉時回傳 None。
+
+        以身分（不是相等）比對——不同專案的欄位值可能完全相同。
+        """
+        return next((i for i, p in enumerate(self._visible) if p is project), None)
 
     def refresh_project(self, project: SpineProject) -> None:
         row = self._row_of(project)
         if row is not None:
             self._fill_row(row, project)
 
-    def remove_project(self, project: SpineProject) -> bool:
-        """從清單移除（只移出編輯器，不動本地檔案）"""
-        row = self._row_of(project)
-        if row is None:
-            return False
-        self._projects.pop(row)
-        self.removeRow(row)
-        if self._projects:
-            self.selectRow(min(row, len(self._projects) - 1))
-        else:
-            self.selection_changed.emit(None)
-        return True
+    def remove_projects(self, projects: list[SpineProject]) -> int:
+        """
+        從清單移除（只移出編輯器，不動本地檔案），回傳實際移除數量。
+
+        移除後整批重建（篩選與排序照舊生效），重建期間會擋掉選取變更訊號，
+        免得中間面板反覆重新載入貼圖與播放器。
+        """
+        targets = {id(p) for p in projects}
+        remaining = [p for p in self._projects if id(p) not in targets]
+        removed = len(self._projects) - len(remaining)
+        if not removed:
+            return 0
+        self._projects = remaining
+        self._rebuild(select_first=False)
+        return removed
 
     def refresh_all(self) -> None:
-        for row, project in enumerate(self._projects):
+        """重新填入所有顯示中的列（狀態或估算變動後呼叫）"""
+        for row, project in enumerate(self._visible):
             self._fill_row(row, project)
 
     def current_project(self) -> SpineProject | None:
         row = self.currentRow()
-        if 0 <= row < len(self._projects):
-            return self._projects[row]
+        if 0 <= row < len(self._visible):
+            return self._visible[row]
         return None
+
+    def selected_projects(self) -> list[SpineProject]:
+        """所有被選取的專案（依清單順序）"""
+        rows = sorted({index.row() for index in self.selectedIndexes()})
+        return [self._visible[r] for r in rows if 0 <= r < len(self._visible)]
 
     def clear_projects(self) -> None:
         self.set_projects([])
+
+    # ------------------------------------------------------------ 右鍵選單
+
+    def _show_context_menu(self, pos) -> None:
+        row = self.rowAt(pos.y())
+        if not 0 <= row < len(self._visible):
+            return
+        # 右鍵點在選取範圍外時只選它——與檔案總管一致，避免誤刪整批
+        if row not in {index.row() for index in self.selectedIndexes()}:
+            self.selectRow(row)
+
+        projects = self.selected_projects()
+        if not projects:
+            return
+
+        menu = QMenu(self)
+        open_action = menu.addAction("開啟檔案資料夾")
+        count = len(projects)
+        remove_action = menu.addAction(f"移除（{count} 份）" if count > 1 else "移除")
+        remove_action.setToolTip("只從清單移除，不會刪除本地檔案")
+
+        chosen = menu.exec(self.viewport().mapToGlobal(pos))
+        if chosen is open_action:
+            self._open_folder(self._visible[row])
+        elif chosen is remove_action:
+            self.remove_requested.emit()
+
+    @staticmethod
+    def _open_folder(project: SpineProject) -> None:
+        folder = project.folder
+        if folder.is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))

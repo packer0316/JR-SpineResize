@@ -9,6 +9,7 @@ from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -22,10 +23,19 @@ from PyQt6.QtWidgets import (
 from config import settings as user_settings
 from config.constants import APP_NAME, APP_TITLE, OUTPUT_CUSTOM
 from config.version import VERSION
+from core.log_writer import log_filename, write_settings_log
 from core.pipeline import BatchResult
+from core.project_file import (
+    FILE_EXTENSION,
+    FILE_FILTER,
+    describe_load,
+    load_project_file,
+    save_project_file,
+)
 from models.size_estimate import aggregate_estimates
 from models.spine_project import STATUS_APPLIED, STATUS_IDLE, SpineProject
 from ui.components.project_detail import ProjectDetail
+from ui.components.project_filter import ProjectFilterBar
 from ui.components.project_list import ProjectList
 from ui.components.settings_panel import SettingsPanel
 from ui.dialogs.about_dialog import AboutDialog
@@ -78,10 +88,7 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        self.project_list = ProjectList()
-        self.project_list.setMinimumWidth(360)
-        self.project_list.selection_changed.connect(self._on_project_selected)
-        splitter.addWidget(self.project_list)
+        splitter.addWidget(self._build_project_column())
 
         self.detail = ProjectDetail()
         self.detail.setMinimumWidth(380)
@@ -141,8 +148,63 @@ class MainWindow(QMainWindow):
         clear_button.setToolTip("清空整個清單（不會刪除本地檔案）")
         clear_button.clicked.connect(self._clear)
         row.addWidget(clear_button)
+
+        row.addWidget(self._separator())
+
+        open_button = QPushButton("開啟專案")
+        open_button.setToolTip(
+            f"載入 *{FILE_EXTENSION} 專案檔——依裡面記錄的絕對路徑重新掃描素材並還原設定"
+        )
+        open_button.clicked.connect(self._open_project_file)
+        row.addWidget(open_button)
+
+        self.save_project_button = QPushButton("儲存專案")
+        self.save_project_button.setToolTip(
+            "把目前的清單與各專案的設定存成專案檔\n"
+            "（只記錄素材的絕對路徑與設定，不含任何圖片）"
+        )
+        self.save_project_button.setEnabled(False)
+        self.save_project_button.clicked.connect(self._save_project_file)
+        row.addWidget(self.save_project_button)
+
+        self.export_log_button = QPushButton("匯出紀錄")
+        self.export_log_button.setToolTip(
+            "把目前已套用的設定寫成一份文字紀錄\n"
+            "（每組設定的完整內容、套用到哪些專案、每張貼圖的路徑與預估容量變化）"
+        )
+        self.export_log_button.setEnabled(False)
+        self.export_log_button.clicked.connect(self._export_log)
+        row.addWidget(self.export_log_button)
+
         row.addStretch(1)
         return row
+
+    @staticmethod
+    def _separator() -> QFrame:
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.VLine)
+        line.setProperty("role", "separator")
+        line.setFixedWidth(1)
+        return line
+
+    def _build_project_column(self) -> QWidget:
+        """左欄：篩選列 + 專案清單"""
+        column = QWidget()
+        column.setMinimumWidth(360)
+        layout = QVBoxLayout(column)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.filter_bar = ProjectFilterBar()
+        self.filter_bar.changed.connect(self._on_filter_changed)
+        layout.addWidget(self.filter_bar)
+
+        self.project_list = ProjectList()
+        self.project_list.selection_changed.connect(self._on_project_selected)
+        self.project_list.remove_requested.connect(self._remove_selected)
+        self.project_list.rows_rebuilt.connect(self._sync_filter_counts)
+        layout.addWidget(self.project_list, 1)
+        return column
 
     def _build_settings_column(self) -> QWidget:
         column = QWidget()
@@ -172,7 +234,10 @@ class MainWindow(QMainWindow):
         apply_row.addWidget(self.unapply_button)
         layout.addLayout(apply_row)
 
-        hint = QLabel("套用後即可在中間預覽切換「原始 / 縮放後」播放對比。")
+        hint = QLabel(
+            "左側清單可用 Ctrl / Shift 多選批量套用，右鍵可開啟檔案資料夾或移除。\n"
+            "套用後即可在中間預覽切換「原始 / 縮放後」播放對比。"
+        )
         hint.setProperty("role", "hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -269,6 +334,102 @@ class MainWindow(QMainWindow):
         self.detail.show_project(None)
         self._update_footer()
 
+    # ------------------------------------------------------------ 專案檔與紀錄
+
+    def _default_save_dir(self) -> Path:
+        """預設存檔位置：使用者最後操作的資料夾"""
+        last = user_settings.load_last_folder()
+        if last and Path(last).is_dir():
+            return Path(last)
+        return Path.home()
+
+    def _save_project_file(self) -> None:
+        projects = self.project_list.projects
+        if not projects:
+            return
+        suggested = self._default_save_dir() / f"專案清單{FILE_EXTENSION}"
+        chosen, _ = QFileDialog.getSaveFileName(
+            self, "儲存專案檔", str(suggested), FILE_FILTER
+        )
+        if not chosen:
+            return
+        try:
+            path = save_project_file(projects, Path(chosen), self._source_roots)
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"專案檔儲存失敗：{exc}")
+            return
+        applied = sum(1 for p in projects if p.applied_options is not None)
+        self.status_label.setText(
+            f"已儲存專案檔（{len(projects)} 份專案、{applied} 份含設定）：{path.name}"
+        )
+
+    def _open_project_file(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "開啟專案檔", str(self._default_save_dir()), FILE_FILTER
+        )
+        if not chosen:
+            return
+        try:
+            result = load_project_file(Path(chosen))
+        except ValueError as exc:
+            QMessageBox.warning(self, APP_NAME, str(exc))
+            return
+
+        if not result.projects:
+            QMessageBox.warning(
+                self, APP_NAME,
+                "專案檔裡記錄的素材都找不到了。\n\n"
+                + "\n".join(result.missing[:8])
+                + ("\n…" if len(result.missing) > 8 else ""),
+            )
+            return
+
+        # 載入專案檔＝換一份工作清單，先收乾淨再換
+        if self._estimate_worker is not None and self._estimate_worker.isRunning():
+            self._estimate_worker.cancel()
+        self._preview_cache.clear()
+        self._source_roots = list(result.source_roots)
+        self.project_list.set_projects(result.projects)
+        self._update_footer()
+        self._start_estimates()
+        self.status_label.setText(describe_load(result))
+
+        notes = []
+        if result.missing:
+            notes.append(
+                f"有 {len(result.missing)} 個檔案已不在原位置：\n"
+                + "\n".join(result.missing[:6])
+                + ("\n…" if len(result.missing) > 6 else "")
+            )
+        if result.unmatched:
+            notes.append(
+                f"有 {len(result.unmatched)} 份專案的素材配對變了，設定沒還原：\n"
+                + "、".join(result.unmatched[:6])
+            )
+        if notes:
+            QMessageBox.information(self, APP_NAME, "\n\n".join(notes))
+
+    def _export_log(self) -> None:
+        projects = self.project_list.projects
+        applied = [p for p in projects if p.applied_options is not None]
+        if not applied:
+            QMessageBox.information(
+                self, APP_NAME, "還沒有任何專案套用設定，沒有內容可以紀錄。"
+            )
+            return
+        suggested = self._default_save_dir() / log_filename()
+        chosen, _ = QFileDialog.getSaveFileName(
+            self, "匯出設定紀錄", str(suggested), "文字檔 (*.txt);;所有檔案 (*.*)"
+        )
+        if not chosen:
+            return
+        try:
+            path = write_settings_log(applied, Path(chosen), total_count=len(projects))
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"紀錄匯出失敗：{exc}")
+            return
+        self.status_label.setText(f"已匯出設定紀錄（{len(applied)} 份專案）：{path.name}")
+
     # ------------------------------------------------------------ 選擇與套用
 
     def _options_fingerprint(self, options) -> tuple:
@@ -277,12 +438,43 @@ class MainWindow(QMainWindow):
 
     def _on_project_selected(self, project: SpineProject | None) -> None:
         self.detail.show_project(project)
-        self.remove_button.setEnabled(project is not None)
+        self._update_selection_labels()
         if project is None:
             return
         if project.applied_options is not None:
             self.settings_panel.set_options(project.applied_options)
             self._attach_preview(project)
+
+    def _on_filter_changed(self) -> None:
+        """篩選條件改動：重建清單並同步計數與按鈕文字"""
+        self.project_list.set_filter(self.filter_bar.criteria())
+        self._sync_filter_counts()
+        self._update_selection_labels()
+
+    def _sync_filter_counts(self) -> None:
+        self.filter_bar.set_counts(
+            len(self.project_list.visible_projects()), len(self.project_list.projects)
+        )
+
+    def _update_selection_labels(self) -> None:
+        """多選時把數量標在按鈕上，避免誤以為只會動到目前這一份"""
+        count = len(self.project_list.selected_projects())
+        self.remove_button.setEnabled(count > 0)
+        if count > 1:
+            self.apply_button.setText(f"套用到選取的 {count} 份 (T)")
+            self.remove_button.setText(f"移除選取（{count}）")
+        else:
+            self.apply_button.setText("套用到此專案 (T)")
+            self.remove_button.setText("移除選取")
+
+        # 有篩選時「套用到全部」只會動到顯示中的專案，按鈕上要講清楚
+        visible = len(self.project_list.visible_projects())
+        if self.project_list.criteria.is_active:
+            self.apply_all_button.setText(f"套用到篩選結果（{visible}）")
+            self.apply_all_button.setToolTip("只套用到目前顯示的專案，被篩選掉的不受影響")
+        else:
+            self.apply_all_button.setText("套用到全部")
+            self.apply_all_button.setToolTip("")
 
     def _attach_preview(self, project: SpineProject) -> None:
         """把快取的（或新建的）縮放後貼圖庫掛到播放器"""
@@ -359,19 +551,37 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _apply_current(self) -> None:
-        project = self.project_list.current_project()
-        if project is None:
+        """套用到目前選取的專案（可多選）"""
+        selected = self.project_list.selected_projects()
+        if not selected:
             return
-        if not project.can_process:
-            QMessageBox.warning(self, APP_NAME, "此專案缺少可用的 atlas 或貼圖，無法處理。")
+        applicable = [p for p in selected if p.can_process]
+        if not applicable:
+            QMessageBox.warning(
+                self, APP_NAME,
+                "選取的專案缺少可用的 atlas 或貼圖，無法處理。" if len(selected) == 1
+                else f"選取的 {len(selected)} 份專案都缺少可用的 atlas 或貼圖，無法處理。",
+            )
             return
-        self._apply_to(project)
-        self._attach_preview(project)
+
+        for project in applicable:
+            self._apply_to(project)
+
+        current = self.project_list.current_project()
+        if current is not None and current.applied_options is not None:
+            self._attach_preview(current)
         self._after_apply()
 
+        skipped = len(selected) - len(applicable)
+        if len(applicable) > 1 or skipped:
+            note = f"（略過無法處理的 {skipped} 份）" if skipped else ""
+            self.status_label.setText(f"已套用到選取的 {len(applicable)} 份專案{note}")
+
     def _apply_all(self) -> None:
+        """套用到清單上所有顯示中的專案（有篩選時就是篩選結果）"""
+        targets = self.project_list.visible_projects()
         applied = 0
-        for project in self.project_list.projects:
+        for project in targets:
             if project.can_process:
                 self._apply_to(project)
                 applied += 1
@@ -379,7 +589,9 @@ class MainWindow(QMainWindow):
         if current is not None and current.applied_options is not None:
             self._attach_preview(current)
         self._after_apply()
-        self.status_label.setText(f"已套用到 {applied} 份專案")
+        hidden = len(self.project_list.projects) - len(targets)
+        note = f"（篩選外的 {hidden} 份未受影響）" if hidden else ""
+        self.status_label.setText(f"已套用到 {applied} 份專案{note}")
 
     def _apply_to(self, project: SpineProject) -> None:
         options = copy.deepcopy(self.settings_panel.get_options())
@@ -393,26 +605,33 @@ class MainWindow(QMainWindow):
             self.detail.apply_estimate(project)
 
     def _remove_selected(self) -> None:
-        """把選取的專案移出清單——只是不再編輯它，本地檔案完全不動"""
-        project = self.project_list.current_project()
-        if project is None:
+        """把選取的專案移出清單——只是不再編輯它們，本地檔案完全不動"""
+        projects = self.project_list.selected_projects()
+        if not projects:
             return
-        self._preview_cache.pop(id(project), None)
-        if self.project_list.remove_project(project):
+        for project in projects:
+            self._preview_cache.pop(id(project), None)
+        if self.project_list.remove_projects(projects):
             self._update_footer()
 
     def _unapply_current(self) -> None:
-        project = self.project_list.current_project()
-        if project is None:
+        """取消目前選取專案的套用（可多選）"""
+        projects = self.project_list.selected_projects()
+        if not projects:
             return
-        project.applied_options = None
-        project.status = STATUS_IDLE
-        project.size_estimate = None
-        self.detail.apply_estimate(project)
-        self._preview_cache.pop(id(project), None)
+        for project in projects:
+            project.applied_options = None
+            project.status = STATUS_IDLE
+            project.size_estimate = None
+            self._preview_cache.pop(id(project), None)
+        current = self.project_list.current_project()
+        if current is not None:
+            self.detail.apply_estimate(current)
         self.detail.player.set_scaled_store(None, "")
         self.detail.preview_hint.setText("")
         self._after_apply()
+        if len(projects) > 1:
+            self.status_label.setText(f"已取消 {len(projects)} 份專案的套用")
 
     def _after_apply(self) -> None:
         self.project_list.refresh_all()
@@ -427,8 +646,16 @@ class MainWindow(QMainWindow):
             self.total_label.setText("")
             self.start_button.setText("開始處理")
             self.start_button.setEnabled(False)
+            self.save_project_button.setEnabled(False)
+            self.export_log_button.setEnabled(False)
+            self._sync_filter_counts()
             return
         applied = [p for p in projects if p.applied_options is not None and p.can_process]
+        self._sync_filter_counts()
+        self.save_project_button.setEnabled(True)
+        self.export_log_button.setEnabled(
+            any(p.applied_options is not None for p in projects)
+        )
         skipped_hint = (
             f"（未套用的 {len(projects) - len(applied)} 份處理時會略過）"
             if applied and len(applied) < len(projects)

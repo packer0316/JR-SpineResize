@@ -32,6 +32,8 @@ from core.project_file import (
     load_project_file,
     save_project_file,
 )
+from core.sheet_group import build_sheet_groups, groups_for_project
+from models.sheet_layout import LayoutStore
 from models.size_estimate import aggregate_estimates
 from models.spine_project import STATUS_APPLIED, STATUS_IDLE, SpineProject
 from ui.components.project_detail import ProjectDetail
@@ -41,6 +43,7 @@ from ui.components.settings_panel import SettingsPanel
 from ui.dialogs.about_dialog import AboutDialog
 from ui.dialogs.progress_dialog import ProgressDialog
 from ui.dialogs.report_dialog import ReportDialog
+from ui.dialogs.sheet_editor import SheetEditorDialog
 from ui.styles.theme import DELTA_DOWN_COLOUR, DELTA_UP_COLOUR, THEMES, build_stylesheet
 from ui.workers import EstimateWorker, PreviewWorker, ProcessWorker, ScanWorker
 from utils.file_utils import format_bytes
@@ -61,6 +64,9 @@ class MainWindow(QMainWindow):
         self._source_roots: list[Path] = []
         # 縮放後貼圖庫快取：id(project) -> (設定指紋, AtlasTextureStore, label)
         self._preview_cache: dict[int, tuple[tuple, object, str]] = {}
+        # 合圖版面：以貼圖路徑為鍵的單一份紀錄。刻意不放進各專案的 options——
+        # 一張合圖被多份專案共用時，版面只能有一份，否則兩邊各改一次就壞了
+        self._layouts = LayoutStore()
 
         self._build_ui()
         theme = user_settings.load_theme()
@@ -99,8 +105,8 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 5)
         splitter.setStretchFactor(2, 0)
-        # 左欄要放得下七個欄位（含容量變化），預設給寬一點免得一開就出現橫向捲軸
-        splitter.setSizes([620, 440, 420])
+        # 左欄要放得下八個欄位（含合圖與容量變化），預設給寬一點免得一開就出現橫向捲軸
+        splitter.setSizes([680, 400, 400])
         splitter.setChildrenCollapsible(False)
         layout.addWidget(splitter, 1)
 
@@ -148,6 +154,17 @@ class MainWindow(QMainWindow):
         clear_button.setToolTip("清空整個清單（不會刪除本地檔案）")
         clear_button.clicked.connect(self._clear)
         row.addWidget(clear_button)
+
+        row.addWidget(self._separator())
+
+        self.sheet_button = QPushButton("合圖編輯")
+        self.sheet_button.setToolTip(
+            "以合圖為單位重新排版：元件各自等比縮放、版面自動縮到最小尺寸\n"
+            "共用同一張合圖的所有 atlas 會一起套用同一份版面"
+        )
+        self.sheet_button.setEnabled(False)
+        self.sheet_button.clicked.connect(lambda: self._open_sheet_editor(None))
+        row.addWidget(self.sheet_button)
 
         row.addWidget(self._separator())
 
@@ -202,6 +219,7 @@ class MainWindow(QMainWindow):
         self.project_list = ProjectList()
         self.project_list.selection_changed.connect(self._on_project_selected)
         self.project_list.remove_requested.connect(self._remove_selected)
+        self.project_list.edit_sheet_requested.connect(self._open_sheet_editor)
         self.project_list.rows_rebuilt.connect(self._sync_filter_counts)
         layout.addWidget(self.project_list, 1)
         return column
@@ -321,6 +339,8 @@ class MainWindow(QMainWindow):
             if key not in existing_keys:
                 merged.append(project)
         self.project_list.set_projects(merged)
+        # 新加入的專案可能用到已經有版面的合圖，標示要跟著更新
+        self._sync_layout_marks()
         self._update_footer()
         if not merged:
             QMessageBox.information(self, APP_NAME, "找不到任何 .skel 或 .atlas 檔案。")
@@ -331,6 +351,8 @@ class MainWindow(QMainWindow):
         self.project_list.clear_projects()
         self._source_roots.clear()
         self._preview_cache.clear()
+        self._layouts.clear()
+        self._sync_layout_marks()
         self.detail.show_project(None)
         self._update_footer()
 
@@ -354,13 +376,16 @@ class MainWindow(QMainWindow):
         if not chosen:
             return
         try:
-            path = save_project_file(projects, Path(chosen), self._source_roots)
+            path = save_project_file(
+                projects, Path(chosen), self._source_roots, self._layouts
+            )
         except OSError as exc:
             QMessageBox.warning(self, APP_NAME, f"專案檔儲存失敗：{exc}")
             return
         applied = sum(1 for p in projects if p.applied_options is not None)
+        sheets = f"、{len(self._layouts)} 張合圖版面" if len(self._layouts) else ""
         self.status_label.setText(
-            f"已儲存專案檔（{len(projects)} 份專案、{applied} 份含設定）：{path.name}"
+            f"已儲存專案檔（{len(projects)} 份專案、{applied} 份含設定{sheets}）：{path.name}"
         )
 
     def _open_project_file(self) -> None:
@@ -389,12 +414,17 @@ class MainWindow(QMainWindow):
             self._estimate_worker.cancel()
         self._preview_cache.clear()
         self._source_roots = list(result.source_roots)
+        self._layouts = result.layouts
         self.project_list.set_projects(result.projects)
+        self._sync_layout_marks()
         self._update_footer()
         self._start_estimates()
         self.status_label.setText(describe_load(result))
 
         notes = []
+        stale = self._stale_layout_notes(result.projects)
+        if stale:
+            notes.append(stale)
         if result.missing:
             notes.append(
                 f"有 {len(result.missing)} 個檔案已不在原位置：\n"
@@ -408,6 +438,31 @@ class MainWindow(QMainWindow):
             )
         if notes:
             QMessageBox.information(self, APP_NAME, "\n\n".join(notes))
+
+    def _stale_layout_notes(self, projects: list[SpineProject]) -> str:
+        """
+        載入的合圖版面與現在的素材對不上時的說明。
+
+        素材被重新匯出（區塊位置變了）時版面就過期了，直接沿用會讓 atlas
+        與貼圖對不上。這裡只回報，並把過期的版面移掉，讓它回到全域比例。
+        """
+        groups = {g.key: g for g in build_sheet_groups(projects)}
+        stale: list[str] = []
+        for layout in self._layouts.layouts():
+            group = groups.get(layout.key)
+            if group is None:
+                continue  # 這張貼圖不在清單裡，留著也不會被用到
+            notes = group.sync_layout(layout)
+            if notes:
+                stale.append(f"{group.name}：{'、'.join(notes)}")
+        if stale:
+            self._sync_layout_marks()
+            return (
+                f"有 {len(stale)} 張合圖的版面已依目前素材重新對齊，請進「合圖編輯」確認：\n"
+                + "\n".join(stale[:6])
+                + ("\n…" if len(stale) > 6 else "")
+            )
+        return ""
 
     def _export_log(self) -> None:
         projects = self.project_list.projects
@@ -424,17 +479,30 @@ class MainWindow(QMainWindow):
         if not chosen:
             return
         try:
-            path = write_settings_log(applied, Path(chosen), total_count=len(projects))
+            path = write_settings_log(
+                applied, Path(chosen), total_count=len(projects), layouts=self._layouts
+            )
         except OSError as exc:
             QMessageBox.warning(self, APP_NAME, f"紀錄匯出失敗：{exc}")
             return
-        self.status_label.setText(f"已匯出設定紀錄（{len(applied)} 份專案）：{path.name}")
+        sheets = f"、{len(self._layouts)} 張合圖版面" if len(self._layouts) else ""
+        self.status_label.setText(
+            f"已匯出設定紀錄（{len(applied)} 份專案{sheets}）：{path.name}"
+        )
 
     # ------------------------------------------------------------ 選擇與套用
 
-    def _options_fingerprint(self, options) -> tuple:
-        # 涵蓋所有會影響輸出貼圖的欄位（含壓縮設定），避免預覽/估算沿用過期快取
-        return options.render_fingerprint()
+    def _options_fingerprint(self, options, project: SpineProject | None = None) -> tuple:
+        """
+        預覽／估算快取的鍵。
+
+        除了設定本身，還要帶上這份專案用到的合圖版面指紋——版面改了但設定
+        沒動時，快取一樣得作廢，不然畫面與數字都會停在舊版面上。
+        """
+        base = options.render_fingerprint()
+        if project is None:
+            return base
+        return base + self._layouts.fingerprint_for(project.page_paths)
 
     def _on_project_selected(self, project: SpineProject | None) -> None:
         self.detail.show_project(project)
@@ -482,11 +550,13 @@ class MainWindow(QMainWindow):
         if options is None or not project.can_preview:
             return
         cached = self._preview_cache.get(id(project))
-        fingerprint = self._options_fingerprint(options)
+        fingerprint = self._options_fingerprint(options, project)
         if cached is not None and cached[0] == fingerprint:
             self.detail.player.set_scaled_store(cached[1], cached[2])
             return
-        worker = PreviewWorker(project, copy.deepcopy(options), self)
+        worker = PreviewWorker(
+            project, copy.deepcopy(options), self._layouts, fingerprint, self
+        )
         # 以 worker 當時的設定當快取鍵——產生期間設定又被改過的話，
         # 這份結果就是過期的，不能用新指紋存進快取
         worker.built.connect(
@@ -501,7 +571,7 @@ class MainWindow(QMainWindow):
 
     def _on_preview_built(self, project, store, label, fingerprint: tuple) -> None:
         options = project.applied_options
-        if options is None or fingerprint != self._options_fingerprint(options):
+        if options is None or fingerprint != self._options_fingerprint(options, project):
             return
         self._preview_cache[id(project)] = (fingerprint, store, label)
         if self.project_list.current_project() is project:
@@ -517,8 +587,8 @@ class MainWindow(QMainWindow):
     def _on_estimate_ready(self, project, estimate) -> None:
         """估算完成：記到專案，更新清單的容量變化欄與詳細面板"""
         options = project.applied_options
-        # 估算期間設定可能又被改過，過期結果直接丟棄
-        if options is None or estimate.fingerprint != self._options_fingerprint(options):
+        # 估算期間設定或合圖版面可能又被改過，過期結果直接丟棄
+        if options is None or estimate.fingerprint != self._options_fingerprint(options, project):
             return
         project.size_estimate = estimate
         self.project_list.refresh_project(project)
@@ -533,19 +603,20 @@ class MainWindow(QMainWindow):
             options = project.applied_options
             if options is None or not project.can_process:
                 continue
+            fingerprint = self._options_fingerprint(options, project)
             estimate = project.size_estimate
-            if estimate is not None and estimate.fingerprint == self._options_fingerprint(options):
+            if estimate is not None and estimate.fingerprint == fingerprint:
                 continue  # 這份的估算還是新的
             # 已經有 PreviewWorker 在算這份（它會順便回報估算），不重複跑
             if any(w.project is project for w in self._preview_workers):
                 continue
-            jobs.append((project, copy.deepcopy(options)))
+            jobs.append((project, copy.deepcopy(options), fingerprint))
         if not jobs:
             return
         if self._estimate_worker is not None and self._estimate_worker.isRunning():
             self._estimate_worker.cancel()
             self._estimate_worker.wait(2000)
-        worker = EstimateWorker(jobs, self)
+        worker = EstimateWorker(jobs, self._layouts, self)
         worker.estimated.connect(self._on_estimate_ready)
         self._estimate_worker = worker
         worker.start()
@@ -604,6 +675,93 @@ class MainWindow(QMainWindow):
         if self.project_list.current_project() is project:
             self.detail.apply_estimate(project)
 
+    # ------------------------------------------------------------ 合圖編輯
+
+    def _open_sheet_editor(self, project: SpineProject | None) -> None:
+        """
+        開啟合圖群組編輯器。
+
+        群組是「一張貼圖 + 所有引用它的 atlas」，所以套用後共用同一張合圖的
+        每一份 atlas 都會拿到同一份版面——這是這個功能存在的理由。
+        """
+        projects = self.project_list.projects
+        if not projects:
+            return
+        groups = build_sheet_groups(projects)
+        if not groups:
+            QMessageBox.information(self, APP_NAME, "清單上的專案都沒有可用的貼圖。")
+            return
+
+        initial = None
+        target = project or self.project_list.current_project()
+        if target is not None:
+            mine = groups_for_project(groups, target)
+            if mine:
+                initial = mine[0].key
+
+        options = self.settings_panel.get_options()
+        dialog = SheetEditorDialog(
+            groups=groups,
+            layouts=self._layouts,
+            default_scale=options.scale,
+            initial_key=initial,
+            parent=self,
+        )
+        if dialog.exec() != SheetEditorDialog.DialogCode.Accepted:
+            return
+
+        layouts, removed = dialog.result_layouts()
+        if not layouts and not removed:
+            return
+        # 先移除再寫入：同一張合圖若先被移除、後來又調整過，要以調整後的版面為準
+        for key in removed:
+            for group in groups:
+                if group.key == key:
+                    self._layouts.remove(group.page_path)
+        for layout in layouts:
+            self._layouts.put(layout)
+
+        self._invalidate_sheet_users(groups, {l.key for l in layouts} | removed)
+        self.status_label.setText(
+            f"已更新 {len(layouts)} 張合圖的版面"
+            + (f"、移除 {len(removed)} 張" if removed else "")
+        )
+
+    def _invalidate_sheet_users(self, groups, keys: set[str]) -> None:
+        """
+        版面變了：所有用到這些合圖的專案都要重算預覽與估算。
+
+        一張合圖被三份專案共用時，三份的預估容量與播放預覽全部得跟著更新，
+        不能只更新目前選到的那一份。
+        """
+        affected: list[SpineProject] = []
+        for group in groups:
+            if group.key not in keys:
+                continue
+            for project in group.projects:
+                if not any(p is project for p in affected):
+                    affected.append(project)
+
+        for project in affected:
+            project.size_estimate = None
+            self._preview_cache.pop(id(project), None)
+
+        self._sync_layout_marks()
+        self.project_list.refresh_all()
+        current = self.project_list.current_project()
+        if current is not None:
+            self.detail.apply_estimate(current)
+            if any(p is current for p in affected) and current.applied_options is not None:
+                self._attach_preview(current)
+        self._start_estimates()
+        self._update_footer()
+
+    def _sync_layout_marks(self) -> None:
+        """把「哪些貼圖有自訂版面」同步給清單與檔案面板"""
+        keys = {layout.key for layout in self._layouts}
+        self.project_list.set_custom_layouts(keys)
+        self.detail.set_custom_layouts(keys)
+
     def _remove_selected(self) -> None:
         """把選取的專案移出清單——只是不再編輯它們，本地檔案完全不動"""
         projects = self.project_list.selected_projects()
@@ -647,12 +805,14 @@ class MainWindow(QMainWindow):
             self.start_button.setText("開始處理")
             self.start_button.setEnabled(False)
             self.save_project_button.setEnabled(False)
+            self.sheet_button.setEnabled(False)
             self.export_log_button.setEnabled(False)
             self._sync_filter_counts()
             return
         applied = [p for p in projects if p.applied_options is not None and p.can_process]
         self._sync_filter_counts()
         self.save_project_button.setEnabled(True)
+        self.sheet_button.setEnabled(True)
         self.export_log_button.setEnabled(
             any(p.applied_options is not None for p in projects)
         )
@@ -661,8 +821,11 @@ class MainWindow(QMainWindow):
             if applied and len(applied) < len(projects)
             else ""
         )
+        sheet_hint = (
+            f"，{len(self._layouts)} 張合圖使用自訂版面" if len(self._layouts) else ""
+        )
         self.status_label.setText(
-            f"已載入 {len(projects)} 份專案，已套用 {len(applied)} 份{skipped_hint}"
+            f"已載入 {len(projects)} 份專案，已套用 {len(applied)} 份{skipped_hint}{sheet_hint}"
         )
         self._update_total_label(applied)
         self.start_button.setText(f"開始處理（{len(applied)}）" if applied else "開始處理")
@@ -706,7 +869,7 @@ class MainWindow(QMainWindow):
         self._progress.cancelled.connect(
             lambda: self._process_worker.cancel() if self._process_worker else None
         )
-        self._process_worker = ProcessWorker(list(projects), self)
+        self._process_worker = ProcessWorker(list(projects), self._layouts, self)
         self._process_worker.progress.connect(self._progress.update_progress)
         self._process_worker.project_done.connect(self.project_list.refresh_project)
         self._process_worker.finished_process.connect(self._on_process_finished)

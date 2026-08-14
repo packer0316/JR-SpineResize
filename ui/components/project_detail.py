@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from models.sheet_layout import layout_key
 from models.spine_project import SpineProject
 from ui.components.spine_player import SpinePlayer
 from ui.styles.theme import DELTA_DOWN_COLOUR, DELTA_UP_COLOUR
@@ -31,6 +32,8 @@ class ProjectDetail(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._project: SpineProject | None = None
+        # 有自訂合圖版面的貼圖（由主視窗同步進來）
+        self._custom_layouts: set[str] = set()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -72,6 +75,14 @@ class ProjectDetail(QWidget):
         layout.addWidget(preview_group, 1)
 
     # ------------------------------------------------------------ 載入
+
+    def set_custom_layouts(self, keys: set[str]) -> None:
+        """更新「哪些貼圖有自訂合圖版面」（檔案清單會標示出來）"""
+        if keys == self._custom_layouts:
+            return
+        self._custom_layouts = set(keys)
+        self._fill_files(self._project)
+        self.apply_estimate(self._project)
 
     def show_project(self, project: SpineProject | None) -> None:
         self._project = project
@@ -179,4 +190,10 @@ class ProjectDetail(QWidget):
                         info = f"{img.size[0]}x{img.size[1]}  {format_bytes(path.stat().st_size)}  {mode}"
                 except OSError:
                     info = "無法讀取"
-                add_row("貼圖", path.name, info)
+                custom = layout_key(path) in self._custom_layouts
+                # 有自訂版面時要講清楚：這張圖不吃全域比例，改設定也不會變
+                add_row(
+                    "貼圖" if not custom else "合圖",
+                    path.name,
+                    f"{info}  ✎自訂版面" if custom else info,
+                )

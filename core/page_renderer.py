@@ -41,20 +41,62 @@ def render_page(
     settings: RenderSettings,
 ) -> RenderResult:
     """依照對照表把來源頁面重繪成縮放後的新頁面。"""
+    return _render(
+        source=source,
+        blits=[(item.src_rect, item.dst_rect) for item in mapping.regions],
+        canvas_size=mapping.dst_canvas,
+        premultiplied=mapping.page.is_premultiplied,
+        settings=settings,
+    )
+
+
+def render_sheet(
+    source: Image.Image,
+    layout,
+    settings: RenderSettings,
+    premultiplied: bool = False,
+) -> RenderResult:
+    """
+    依合圖版面重繪整張合圖（元件各自的比例與新位置都來自版面）。
+
+    這裡刻意走**版面的元件聯集**而不是某一份 atlas 的區塊清單：一張合圖被
+    三份 atlas 共用時，每份 atlas 只認得自己那部分的區塊，若照著其中一份畫，
+    另外兩份需要的像素就不會出現在輸出的圖裡。
+
+    Args:
+        layout: ``models.sheet_layout.SheetLayout``
+    """
+    return _render(
+        source=source,
+        blits=[
+            (p.src_rect, p.dst_rect) for p in layout.placements if p.pos is not None
+        ],
+        canvas_size=layout.canvas,
+        premultiplied=premultiplied,
+        settings=settings,
+    )
+
+
+def _render(
+    source: Image.Image,
+    blits: list[tuple[tuple[int, int, int, int], tuple[int, int, int, int]]],
+    canvas_size: tuple[int, int],
+    premultiplied: bool,
+    settings: RenderSettings,
+) -> RenderResult:
+    """逐塊裁切 → 各自縮放 → 放進新畫布的對應位置。"""
     notes: list[str] = []
     src = to_rgba_array(source)
     src_h, src_w = src.shape[:2]
 
-    canvas_w, canvas_h = mapping.dst_canvas
+    canvas_w, canvas_h = canvas_size
     canvas = np.zeros((canvas_h, canvas_w, 4), dtype=np.uint8)
     occupied = np.zeros((canvas_h, canvas_w), dtype=bool)
 
     resample = get_resample(settings.resample)
-    premultiplied = mapping.page.is_premultiplied
 
     clipped = 0
-    for item in mapping.regions:
-        sx, sy, sw, sh = item.src_rect
+    for (sx, sy, sw, sh), (dx, dy, dw, dh) in blits:
         # 來源座標可能超出實際圖檔（atlas 與 png 不同步時），先夾住避免整批失敗
         x0, y0 = max(0, sx), max(0, sy)
         x1, y1 = min(src_w, sx + sw), min(src_h, sy + sh)
@@ -65,7 +107,6 @@ def render_page(
             clipped += 1
 
         block = src[y0:y1, x0:x1]
-        dx, dy, dw, dh = item.dst_rect
         if dw <= 0 or dh <= 0:
             continue
 

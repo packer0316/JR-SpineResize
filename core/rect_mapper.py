@@ -190,6 +190,33 @@ def map_region(
     dst_x, dst_w = _map_axis(src_x, src_w, scale_x, canvas_w)
     dst_y, dst_h = _map_axis(src_y, src_h, scale_y, canvas_h)
 
+    return _finish_region(region, (dst_x, dst_y, dst_w, dst_h), scale_x, scale_y)
+
+
+def map_region_to_rect(region: AtlasRegion, dst_rect: tuple[int, int, int, int]) -> RegionMapping:
+    """
+    把區塊映射到指定的目標矩形（合圖版面模式）。
+
+    位置與尺寸都由版面決定，比例則從「新／舊寬高」反推——每個區塊各自等比，
+    所以 x 與 y 的比例相同，size/orig 與 offset/orig 兩個比值依舊守得住。
+    """
+    src_x, src_y, src_w, src_h = region.page_rect
+    dst_w, dst_h = dst_rect[2], dst_rect[3]
+    scale_x = dst_w / src_w if src_w else 1.0
+    scale_y = dst_h / src_h if src_h else 1.0
+    return _finish_region(region, dst_rect, scale_x, scale_y)
+
+
+def _finish_region(
+    region: AtlasRegion,
+    dst_rect: tuple[int, int, int, int],
+    scale_x: float,
+    scale_y: float,
+) -> RegionMapping:
+    """由「已決定的目標矩形」算出 size / orig / offset 與漂移量。"""
+    src_x, src_y, src_w, src_h = region.page_rect
+    dst_x, dst_y, dst_w, dst_h = dst_rect
+
     rotated = region.is_rotated
     if rotated:
         # 旋轉時區塊自身的 x 軸躺在頁面的 y 軸上
@@ -275,6 +302,38 @@ def _offset_drift(
         new = _ratio(new_offset[i], new_orig[i])
         drift.append((new - old) * 100.0 if old is not None and new is not None else 0.0)
     return drift[0], drift[1]
+
+
+def build_layout_mapping(page: AtlasPage, layout) -> tuple[PageMapping, list[str]]:
+    """
+    依合圖版面建立對照表（每個區塊各自的比例與位置都由版面決定）。
+
+    版面是「整張貼圖」的屬性，一次算好套用到所有共用它的 atlas，
+    所以三份 atlas 拿到的座標一定一致。
+
+    Args:
+        page: 要重算的 atlas 頁面
+        layout: ``models.sheet_layout.SheetLayout``
+
+    Returns:
+        (對照表, 找不到對應元件的區塊名稱)——後者代表版面與 atlas 不同步。
+    """
+    placements = layout.by_rect()
+    mapping = PageMapping(
+        page=page,
+        src_size=page.size,
+        dst_canvas=layout.canvas,
+        scale_x=0.0,   # 版面模式沒有單一比例；漂移統計以各區塊自己的比例計算
+        scale_y=0.0,
+    )
+    unmatched: list[str] = []
+    for region in page.regions:
+        placement = placements.get(region.page_rect)
+        if placement is None or placement.pos is None:
+            unmatched.append(region.name)
+            continue
+        mapping.regions.append(map_region_to_rect(region, placement.dst_rect))
+    return mapping, unmatched
 
 
 def build_page_mapping(

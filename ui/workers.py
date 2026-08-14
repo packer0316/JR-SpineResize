@@ -10,6 +10,7 @@ from core.pipeline import BatchResult, RenderedPage, build_preview, process_asse
 from core.project_scanner import scan_projects
 from core.spine.texture_store import AtlasTextureStore
 from models.process_options import ProcessOptions
+from models.sheet_layout import LayoutStore
 from models.spine_project import STATUS_DONE, STATUS_FAILED, SpineProject
 
 
@@ -33,9 +34,15 @@ class ProcessWorker(QThread):
     project_done = pyqtSignal(object)          # SpineProject
     finished_process = pyqtSignal(object, list)  # BatchResult, skipped names
 
-    def __init__(self, projects: list[SpineProject], parent=None) -> None:
+    def __init__(
+        self,
+        projects: list[SpineProject],
+        layouts: LayoutStore | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self._projects = projects
+        self._layouts = layouts
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -64,6 +71,7 @@ class ProcessWorker(QThread):
                     options,
                     rendered_pages=rendered_pages,
                     progress=lambda msg, i=index: self.progress.emit(i, total, msg),
+                    layouts=self._layouts,
                 )
                 batch.results.append(result)
                 if not result.ok:
@@ -79,8 +87,9 @@ class ProcessWorker(QThread):
         self.finished_process.emit(batch, skipped)
 
 
-def _preview_label(options: ProcessOptions) -> str:
-    return f"{options.scale_percent:g}%" if options.resize_enabled else "壓縮後"
+def _preview_label(options: ProcessOptions, custom_layouts: int = 0) -> str:
+    base = f"{options.scale_percent:g}%" if options.resize_enabled else "壓縮後"
+    return f"{base} + 自訂合圖" if custom_layouts else base
 
 
 class PreviewWorker(QThread):
@@ -95,10 +104,19 @@ class PreviewWorker(QThread):
     estimated = pyqtSignal(object, object)    # project, SizeEstimate
     failed = pyqtSignal(object, str)          # project, error
 
-    def __init__(self, project: SpineProject, options: ProcessOptions, parent=None) -> None:
+    def __init__(
+        self,
+        project: SpineProject,
+        options: ProcessOptions,
+        layouts: LayoutStore | None = None,
+        fingerprint: tuple | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.project = project  # 公開：呼叫端用來判斷這份是否已在計算中
         self._options = options
+        self._layouts = layouts
+        self._fingerprint = fingerprint
 
     def run(self) -> None:
         project = self.project
@@ -111,10 +129,20 @@ class PreviewWorker(QThread):
             self.failed.emit(project, "「只重算 atlas」模式不提供縮放預覽")
             return
         try:
-            build = build_preview(project.atlases, options, preview_asset=primary)
+            build = build_preview(
+                project.atlases,
+                options,
+                preview_asset=primary,
+                layouts=self._layouts,
+                fingerprint=self._fingerprint,
+            )
             if build.atlas is not None:
                 store = AtlasTextureStore(build.atlas, build.pages)
-                self.built.emit(project, store, _preview_label(options))
+                custom = sum(
+                    1 for path in project.page_paths
+                    if self._layouts is not None and self._layouts.has(path)
+                )
+                self.built.emit(project, store, _preview_label(options, custom))
             self.estimated.emit(project, build.estimate)
         except Exception as exc:  # noqa: BLE001 - 預覽失敗回報即可
             self.failed.emit(project, str(exc))
@@ -131,22 +159,33 @@ class EstimateWorker(QThread):
     estimated = pyqtSignal(object, object)  # project, SizeEstimate
     finished_all = pyqtSignal()
 
-    def __init__(self, jobs: list[tuple[SpineProject, ProcessOptions]], parent=None) -> None:
+    def __init__(
+        self,
+        jobs: list[tuple[SpineProject, ProcessOptions, tuple]],
+        layouts: LayoutStore | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self._jobs = jobs
+        self._layouts = layouts
         self._cancelled = False
 
     def cancel(self) -> None:
         self._cancelled = True
 
     def run(self) -> None:
-        for project, options in self._jobs:
+        for project, options, fingerprint in self._jobs:
             if self._cancelled:
                 break
             if options.mode != MODE_RESCALE:
                 continue  # 只重算 atlas：貼圖原樣複製，容量不變
             try:
-                build = build_preview(project.atlases, options)
+                build = build_preview(
+                    project.atlases,
+                    options,
+                    layouts=self._layouts,
+                    fingerprint=fingerprint,
+                )
             except Exception:  # noqa: BLE001 - 單一專案估算失敗不影響其他
                 continue
             if not self._cancelled:

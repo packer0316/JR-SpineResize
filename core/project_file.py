@@ -17,6 +17,7 @@ from pathlib import Path
 from config.version import VERSION
 from core.project_scanner import scan_projects
 from models.process_options import ProcessOptions
+from models.sheet_layout import LayoutStore
 from models.spine_project import STATUS_APPLIED, SpineProject
 
 FILE_EXTENSION = ".jrspine"
@@ -46,6 +47,8 @@ class LoadResult:
     applied: int = 0
     saved_at: str = ""
     saved_version: str = ""
+    # 合圖版面（以貼圖路徑為鍵，不隸屬任何單一專案）
+    layouts: LayoutStore = field(default_factory=LayoutStore)
 
 
 # ---------------------------------------------------------------- 儲存
@@ -55,12 +58,16 @@ def save_project_file(
     projects: list[SpineProject],
     path: Path,
     source_roots: list[Path] | None = None,
+    layouts: LayoutStore | None = None,
 ) -> Path:
     """
     寫出專案檔。
 
     未套用設定的專案也會記錄（只是 options 為 null），這樣下次開啟時
     整個工作清單都在，不必重新拖檔。
+
+    合圖版面存在**頂層**而不是各專案的 options 裡：一張合圖可能被好幾份
+    專案共用，版面只該有一份，存在各自的設定裡遲早會不一致。
     """
     entries = []
     for project in projects:
@@ -79,6 +86,7 @@ def save_project_file(
         "note": "此檔只記錄素材的絕對路徑與設定，不含任何圖片資料",
         "source_roots": [str(Path(r).resolve()) for r in (source_roots or [])],
         "projects": entries,
+        "sheet_layouts": layouts.to_list() if layouts is not None else [],
     }
 
     if path.suffix.lower() != FILE_EXTENSION:
@@ -160,6 +168,10 @@ def load_project_file(path: Path) -> LoadResult:
         project.status = STATUS_APPLIED
         result.applied += 1
 
+    # 合圖版面（頂層，不隸屬任何專案）——貼圖已不在的版面照樣留著，
+    # 載入時由 sheet_group 對齊；真的用不到時處理階段自然不會碰到它
+    result.layouts.load_list(payload.get("sheet_layouts", []))
+
     # 檔案還在、但重新掃描後配對結果不同的（例如 atlas 被改名或搬走）
     result.unmatched = [
         str(entry.get("name") or entry.get("skeleton") or "")
@@ -172,6 +184,8 @@ def load_project_file(path: Path) -> LoadResult:
 def describe_load(result: LoadResult) -> str:
     """給使用者看的載入摘要"""
     parts = [f"載入 {len(result.projects)} 份專案，其中 {result.applied} 份已套用設定"]
+    if len(result.layouts):
+        parts.append(f"、{len(result.layouts)} 張合圖有自訂版面")
     if result.saved_at:
         parts.append(f"（存檔時間 {result.saved_at}）")
     return "".join(parts)

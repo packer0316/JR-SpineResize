@@ -31,8 +31,14 @@ from core.asset_scanner import resolve_page
 from core.atlas_parser import parse_atlas_file, write_atlas_file
 from core.compressor import Compressor, describe_encoding, format_for_suffix
 from core.exceptions import AtlasParseError, PageImageError, ProcessError
-from core.page_renderer import RenderSettings, render_page
-from core.rect_mapper import align_up, apply_page_mapping, build_page_mapping, round_half_up
+from core.page_renderer import RenderSettings, render_page, render_sheet
+from core.rect_mapper import (
+    align_up,
+    apply_page_mapping,
+    build_layout_mapping,
+    build_page_mapping,
+    round_half_up,
+)
 from core.validator import (
     LEVEL_ERROR,
     LEVEL_INFO,
@@ -47,6 +53,7 @@ from core.validator import (
 from models.atlas_data import AtlasFile
 from models.compression_options import CompressionOptions
 from models.process_options import ProcessOptions
+from models.sheet_layout import LayoutStore, SheetLayout
 from models.size_estimate import PageEstimate, SizeEstimate
 from models.spine_asset import SpineAsset
 from utils.file_utils import copy_file, longest_matching_root
@@ -229,18 +236,40 @@ class RenderedPage:
     source_mode: str
     encoding: str
     owner: str  # 第一個產生它的 atlas 檔名（訊息用）
+    # 產生它的合圖版面指紋；有版面時用它判斷能不能沿用（比逐區塊比對更直接）
+    layout_fingerprint: tuple | None = None
 
 
 def _region_keys(mapping) -> set[tuple[str, tuple[int, int, int, int]]]:
     return {(item.region.name, item.dst_rect) for item in mapping.regions}
 
 
-def _reuse_blocker(record: RenderedPage, src_path: Path, canvas: tuple[int, int], mapping) -> str:
+def _reuse_blocker(
+    record: RenderedPage,
+    src_path: Path,
+    canvas: tuple[int, int],
+    mapping,
+    layout: SheetLayout | None = None,
+) -> str:
     """回傳不能沿用的原因；空字串表示可以沿用。"""
     if record.src_path != src_path.resolve():
         return (
             f"另一份 atlas（{record.owner}）已經輸出到同一個檔名，但來源貼圖不同，"
             "請改用不同的檔名後綴或輸出資料夾"
+        )
+    if layout is not None:
+        # 合圖版面模式：版面是整張貼圖的屬性，指紋相同就代表兩份 atlas 拿到
+        # 的是同一份排版結果，不必再逐區塊比對
+        if record.layout_fingerprint != layout.fingerprint():
+            return (
+                f"與 {record.owner} 共用同一張貼圖，但兩者的合圖版面不同——"
+                "請重新開啟合圖編輯器套用同一份版面"
+            )
+        return ""
+    if record.layout_fingerprint is not None:
+        return (
+            f"與 {record.owner} 共用同一張貼圖，但那一份用了自訂合圖版面、"
+            "這一份沒有；請對整個合圖群組套用同一種設定"
         )
     if record.canvas != canvas:
         return (
@@ -267,6 +296,7 @@ def process_asset(
     options: ProcessOptions,
     rendered_pages: dict[Path, RenderedPage] | None = None,
     progress: ProgressCallback | None = None,
+    layouts: LayoutStore | None = None,
 ) -> AssetResult:
     """
     處理單一 Spine 資產。
@@ -274,6 +304,9 @@ def process_asset(
     ``rendered_pages`` 記錄同一批次內已經產生過的貼圖（輸出路徑 -> RenderedPage）。
     多個 atlas 共用同一張貼圖是常見作法（實測素材中就有三個 atlas 指向同一張 png），
     第二份之後直接沿用，不重複渲染，也不會因為「來源已經被自己縮過」而誤判失敗。
+
+    ``layouts`` 是合圖版面庫（以貼圖路徑為鍵）。有版面的頁面完全依版面輸出，
+    全域的縮放比例對它不生效——版面本身已經記著每個元件要縮多少。
     """
     started = time.perf_counter()
     result = AssetResult(asset=asset)
@@ -332,6 +365,7 @@ def process_asset(
                 pending_writes=pending_writes,
                 fresh_pages=fresh_pages,
                 owner=asset.atlas_path.name,
+                layout=layouts.get(src_path) if layouts is not None else None,
             )
         except (PageImageError, ProcessError) as exc:
             result.report.add(LEVEL_ERROR, f"[{page.name}] {exc}")
@@ -387,6 +421,7 @@ def _process_page(
     pending_writes: list[tuple[Path, bytes | Path]],
     fresh_pages: dict[Path, RenderedPage],
     owner: str,
+    layout: SheetLayout | None = None,
 ) -> PageOutput | None:
     """處理單一頁面：算出縮放比例、產生新貼圖、把座標寫回 atlas。"""
     declared = page.size
@@ -394,19 +429,39 @@ def _process_page(
     dst_path = out_dir / dst_name
 
     if options.mode == MODE_RESCALE:
-        scale = options.scale
-        canvas = (
-            max(1, align_up(round_half_up(declared[0] * scale), options.page_align)),
-            max(1, align_up(round_half_up(declared[1] * scale), options.page_align)),
-        )
-        mapping = build_page_mapping(page, scale, scale, canvas)
+        if layout is not None and not layout.is_packed:
+            report.add(
+                LEVEL_ERROR,
+                f"[{page.name}] 合圖版面尚未排版完成，請在合圖編輯器裡重新排版",
+            )
+            return None
+
+        if layout is not None:
+            scale = 0.0  # 版面模式沒有單一比例
+            canvas = layout.canvas
+            mapping, unmatched = build_layout_mapping(page, layout)
+            if unmatched:
+                shown = "、".join(unmatched[:5]) + (" …" if len(unmatched) > 5 else "")
+                report.add(
+                    LEVEL_ERROR,
+                    f"[{page.name}] 合圖版面與 atlas 不同步，"
+                    f"{len(unmatched)} 個區塊找不到對應元件：{shown}",
+                )
+                return None
+        else:
+            scale = options.scale
+            canvas = (
+                max(1, align_up(round_half_up(declared[0] * scale), options.page_align)),
+                max(1, align_up(round_half_up(declared[1] * scale), options.page_align)),
+            )
+            mapping = build_page_mapping(page, scale, scale, canvas)
 
         # 先看這張貼圖本批次是不是已經產生過（多個 atlas 共用一張圖）。
         # 這個判斷必須在讀圖之前：覆蓋模式下來源已被我們改成縮好的圖，
         # 若先去檢查「宣告尺寸 vs 實際尺寸」一定會誤判成二次縮放而失敗。
         record = rendered_pages.get(dst_path.resolve())
         if record is not None:
-            blocker = _reuse_blocker(record, src_path, canvas, mapping)
+            blocker = _reuse_blocker(record, src_path, canvas, mapping, layout)
             if blocker:
                 report.add(LEVEL_ERROR, f"[{page.name}] {blocker}")
                 return None
@@ -446,7 +501,12 @@ def _process_page(
             return None
 
         src_bytes = src_path.stat().st_size
-        render = render_page(source, mapping, settings)
+        if layout is not None:
+            # 版面模式畫的是「版面上的所有元件」，不是這一份 atlas 的區塊清單——
+            # 共用這張合圖的其他 atlas 需要的像素也必須在圖裡
+            render = render_sheet(source, layout, settings, page.is_premultiplied)
+        else:
+            render = render_page(source, mapping, settings)
         for note in render.notes:
             report.add(LEVEL_INFO, f"[{page.name}] {note}")
         payload, encoding, dst_bytes = _encode_texture(
@@ -468,6 +528,7 @@ def _process_page(
             source_mode=source_mode,
             encoding=encoding,
             owner=owner,
+            layout_fingerprint=layout.fingerprint() if layout is not None else None,
         )
 
         report.extend(validate_page(mapping, canvas))
@@ -487,6 +548,14 @@ def _process_page(
         )
 
     # ---------------------------------------------------------------- 只重算 atlas
+    if layout is not None:
+        # 這個模式的貼圖是外部工具縮好的，本工具不重繪，自然也套不上版面。
+        # 靜靜忽略會讓人以為版面生效了，所以明講一句。
+        report.add(
+            LEVEL_WARNING,
+            f"[{page.name}] 「只重算 atlas」模式不會重新排版，自訂合圖版面已略過",
+        )
+
     scaled_path = _find_prescaled_page(page.name, src_path, options)
     if scaled_path is None:
         raise PageImageError(
@@ -566,16 +635,21 @@ def build_preview(
     assets: list[SpineAsset],
     options: ProcessOptions,
     preview_asset: SpineAsset | None = None,
+    layouts: LayoutStore | None = None,
+    fingerprint: tuple | None = None,
 ) -> PreviewBuild:
     """
     估算處理後的貼圖大小，必要時一併產生預覽貼圖。
 
-    走與正式輸出完全相同的路徑（build_page_mapping → render_page →
-    compress_texture），只是壓縮用快速模式（oxipng level 1）加速，
+    走與正式輸出完全相同的路徑（build_page_mapping / build_layout_mapping →
+    render → compress_texture），只是壓縮用快速模式（oxipng level 1）加速，
     所以數字與畫面都忠於實際輸出。
 
     ``preview_asset`` 指定時會保留該 atlas 的壓縮後貼圖；其餘 atlas 只算大小，
     不留影像（批次估算數十份專案時記憶體才不會爆）。
+
+    ``fingerprint`` 是給估算結果的快取鍵；省略時只用 options 的指紋
+    （呼叫端若有合圖版面，要把版面指紋一起算進來）。
 
     Raises:
         ProcessError: 貼圖實際尺寸與 atlas 宣告不符（可能已經被縮過一次）。
@@ -587,7 +661,11 @@ def build_preview(
         bleed_px=options.bleed_px,
     )
     scale = options.scale
-    build = PreviewBuild(estimate=SizeEstimate(fingerprint=options.render_fingerprint()))
+    build = PreviewBuild(
+        estimate=SizeEstimate(
+            fingerprint=fingerprint if fingerprint is not None else options.render_fingerprint()
+        )
+    )
     seen_sources: set[Path] = set()
 
     for asset in assets:
@@ -608,12 +686,28 @@ def build_preview(
                     f"{page.name} 實際尺寸與 atlas 宣告不符，可能已被縮放過"
                 )
 
-            canvas = (
-                max(1, align_up(round_half_up(declared[0] * scale), options.page_align)),
-                max(1, align_up(round_half_up(declared[1] * scale), options.page_align)),
-            )
-            mapping = build_page_mapping(page, scale, scale, canvas)
-            rendered = render_page(source, mapping, settings).image
+            layout = layouts.get(src_path) if layouts is not None else None
+            if layout is not None and layout.is_packed:
+                canvas = layout.canvas
+                mapping, unmatched = build_layout_mapping(page, layout)
+                if unmatched:
+                    raise ProcessError(
+                        f"{page.name} 的合圖版面與 atlas 不同步"
+                        f"（{len(unmatched)} 個區塊找不到對應元件）"
+                    )
+                rendered = render_sheet(
+                    source, layout, settings, page.is_premultiplied
+                ).image
+                page_scale = 0.0  # 版面模式：像素一定變了，不套用「絕不變大」保護
+            else:
+                canvas = (
+                    max(1, align_up(round_half_up(declared[0] * scale), options.page_align)),
+                    max(1, align_up(round_half_up(declared[1] * scale), options.page_align)),
+                )
+                mapping = build_page_mapping(page, scale, scale, canvas)
+                rendered = render_page(source, mapping, settings).image
+                page_scale = scale
+
             preview_img, data, _ = compress_texture(
                 rendered, src_path.suffix, options.compression, fast=True
             )
@@ -629,7 +723,7 @@ def build_preview(
             src_bytes = src_path.stat().st_size if src_path.exists() else 0
             est_bytes = len(data)
             # 與 _encode_texture 的「絕不變大保護」一致
-            if scale == 1.0 and not options.compression.alters_pixels and src_bytes:
+            if page_scale == 1.0 and not options.compression.alters_pixels and src_bytes:
                 est_bytes = min(est_bytes, src_bytes)
             build.estimate.pages.append(PageEstimate(
                 src_path=key,
@@ -650,6 +744,7 @@ def process_batch(
     options: ProcessOptions,
     progress: Callable[[int, int, str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    layouts: LayoutStore | None = None,
 ) -> BatchResult:
     """批次處理。同一批次內共用貼圖的 atlas 只會渲染一次。"""
     batch = BatchResult()
@@ -667,6 +762,7 @@ def process_batch(
                 options,
                 rendered_pages=rendered_pages,
                 progress=lambda msg: progress(index, total, msg) if progress else None,
+                layouts=layouts,
             )
         )
 

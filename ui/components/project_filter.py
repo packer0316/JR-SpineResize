@@ -8,7 +8,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from core.sheet_group import cluster_projects
 from models.spine_project import (
     STATUS_APPLIED,
     STATUS_DONE,
@@ -76,8 +77,17 @@ POT_FILTERS: list[tuple[str, str | None]] = [
     ("非 2 的次方", "npot"),
 ]
 
-# 排序
+# 是否與其他專案共用貼圖
+SHARED_FILTERS: list[tuple[str, str | None]] = [
+    ("全部", None),
+    ("共用貼圖", "shared"),
+    ("獨立貼圖", "solo"),
+]
+
+# 排序。預設「共用貼圖」：用到同一張合圖的專案一定相鄰，才不會改了一份
+# 卻漏掉另外兩份（共用貼圖只要有一份沒跟著改，輸出就是壞的）
 SORT_OPTIONS: list[tuple[str, str]] = [
+    ("共用貼圖（同組相鄰）", "shared"),
     ("名稱", "name"),
     ("容量 大→小", "size_desc"),
     ("容量 小→大", "size_asc"),
@@ -99,7 +109,15 @@ class FilterCriteria:
     status: str | None = None
     preview: str | None = None
     pot: str | None = None
-    sort: str = "name"
+    shared: str | None = None
+    sort: str = "shared"
+
+    # 判斷「共用貼圖」需要跟整份清單比對，不能只看單一專案，
+    # 所以 matches() 前先由 apply() 算好這張表。這是快取不是條件，
+    # 每次 apply() 都會重算，不參與比較與顯示。
+    _shared_ids: frozenset[int] = field(
+        default=frozenset(), compare=False, repr=False
+    )
 
     @property
     def active_count(self) -> int:
@@ -113,6 +131,7 @@ class FilterCriteria:
                 self.status,
                 self.preview,
                 self.pot,
+                self.shared,
             )
             if value
         )
@@ -151,12 +170,25 @@ class FilterCriteria:
             if (self.pot == "pot") != project.pages_are_pot:
                 return False
 
+        if self.shared is not None:
+            is_shared = id(project) in self._shared_ids
+            if (self.shared == "shared") != is_shared:
+                return False
+
         return True
 
     # ------------------------------------------------------------ 排序
 
     def apply(self, projects: list[SpineProject]) -> list[SpineProject]:
         """回傳篩選並排序後的清單"""
+        clusters = cluster_projects(projects)
+        counts: dict[int, int] = {}
+        for cluster_id in clusters.values():
+            counts[cluster_id] = counts.get(cluster_id, 0) + 1
+        self._shared_ids = frozenset(
+            key for key, cluster_id in clusters.items() if counts[cluster_id] > 1
+        )
+
         result = [p for p in projects if self.matches(p)]
 
         def delta_ratio(project: SpineProject) -> float:
@@ -175,12 +207,35 @@ class FilterCriteria:
             "delta_desc": (delta_ratio, True),
             "delta_asc": (delta_ratio, False),
         }
-        if self.sort in keys:
+        if self.sort == "shared":
+            result.sort(key=self._shared_sort_key(result, clusters))
+        elif self.sort in keys:
             key, reverse = keys[self.sort]
             result.sort(key=key, reverse=reverse)
         else:  # 名稱：同名時用資料夾當第二鍵，順序才穩定
             result.sort(key=lambda p: (p.name.lower(), str(p.folder).lower()))
         return result
+
+    @staticmethod
+    def _shared_sort_key(projects: list[SpineProject], clusters: dict[int, int]):
+        """
+        共用貼圖排序：整體仍接近字母序，但共用同一張貼圖的專案會被拉到
+        同一群的第一份後面，保證相鄰。
+
+        群的排序鍵取「群內最小的（資料夾, 名稱）」——所以群的位置就是它
+        第一份成員原本會出現的位置，不會為了分群而把順序整個打亂。
+        """
+        def own_key(project: SpineProject) -> tuple[str, str]:
+            return str(project.folder).lower(), project.name.lower()
+
+        cluster_key: dict[int, tuple[str, str]] = {}
+        for project in projects:
+            cluster_id = clusters[id(project)]
+            key = own_key(project)
+            if cluster_id not in cluster_key or key < cluster_key[cluster_id]:
+                cluster_key[cluster_id] = key
+
+        return lambda p: (cluster_key[clusters[id(p)]], own_key(p))
 
 
 class ProjectFilterBar(QWidget):
@@ -247,16 +302,21 @@ class ProjectFilterBar(QWidget):
         self.status_combo = self._make_combo(STATUS_FILTERS)
         self.preview_combo = self._make_combo(PREVIEW_FILTERS)
         self.pot_combo = self._make_combo(POT_FILTERS)
+        self.shared_combo = self._make_combo(SHARED_FILTERS)
+        self.shared_combo.setToolTip("是否與清單上其他專案共用同一張貼圖")
         self.sort_combo = self._make_combo(SORT_OPTIONS)
 
         rows = (
             ("尺寸", self.page_size_combo, "容量", self.texture_combo),
             ("狀態", self.status_combo, "預覽", self.preview_combo),
-            ("規格", self.pot_combo, "排序", self.sort_combo),
+            ("規格", self.pot_combo, "共用", self.shared_combo),
+            ("排序", self.sort_combo, "", None),
         )
         for index, (label_a, combo_a, label_b, combo_b) in enumerate(rows):
             grid.addWidget(self._label(label_a), index, 0)
             grid.addWidget(combo_a, index, 1)
+            if combo_b is None:  # 最後一列只有左半邊（排序）
+                continue
             grid.addWidget(self._label(label_b), index, 2)
             grid.addWidget(combo_b, index, 3)
         panel_layout.addLayout(grid)
@@ -291,6 +351,7 @@ class ProjectFilterBar(QWidget):
             self.status_combo,
             self.preview_combo,
             self.pot_combo,
+            self.shared_combo,
             self.sort_combo,
         ]
 
@@ -302,7 +363,8 @@ class ProjectFilterBar(QWidget):
             status=self.status_combo.currentData(),
             preview=self.preview_combo.currentData(),
             pot=self.pot_combo.currentData(),
-            sort=self.sort_combo.currentData() or "name",
+            shared=self.shared_combo.currentData(),
+            sort=self.sort_combo.currentData() or "shared",
         )
 
     def reset(self) -> None:

@@ -109,6 +109,21 @@ class SpineProject:
         )
 
     @property
+    def page_paths(self) -> list[Path]:
+        """這份專案用到的所有貼圖（去重，依出現順序）——共用貼圖的分群依據"""
+        result: list[Path] = []
+        seen: set[str] = set()
+        for asset in self.atlases:
+            for path in asset.pages.values():
+                if path is None:
+                    continue
+                key = str(path).lower()
+                if key not in seen:
+                    seen.add(key)
+                    result.append(path)
+        return result
+
+    @property
     def source_bytes(self) -> int:
         total = 0
         seen: set[Path] = set()

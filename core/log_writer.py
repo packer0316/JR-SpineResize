@@ -29,6 +29,7 @@ from config.constants import (
 from config.version import VERSION
 from models.compression_options import PngColorFormat, PngMode
 from models.process_options import ProcessOptions
+from models.sheet_layout import LayoutStore
 from models.size_estimate import aggregate_estimates
 from models.spine_project import SpineProject
 from utils.file_utils import format_bytes
@@ -130,7 +131,46 @@ def describe_options(options: ProcessOptions) -> list[str]:
     return lines
 
 
-def _project_block(index: int, project: SpineProject) -> list[str]:
+def _layout_block(layouts: LayoutStore) -> list[str]:
+    """
+    自訂合圖版面的清單。
+
+    有版面的合圖不吃上面那組設定的縮放比例（版面自己記著每個元件的比例），
+    紀錄裡一定要講清楚，否則會以為它也是照「縮放 50%」處理的。
+    """
+    items = layouts.layouts()
+    if not items:
+        return []
+    lines = [
+        "",
+        _SEPARATOR,
+        f"自訂合圖版面　—　{len(items)} 張合圖",
+        _SEPARATOR,
+        "這些合圖由版面決定輸出（畫布尺寸與每個元件的位置、大小），",
+        "上面各組設定的「縮放比例」對它們不生效；壓縮設定照樣生效。",
+        "",
+    ]
+    for index, layout in enumerate(sorted(items, key=lambda item: item.key), start=1):
+        scale = layout.uniform_scale
+        scale_text = f"整組 {scale * 100:g}%" if scale is not None else "各元件不同比例"
+        pinned = sum(1 for p in layout.placements if p.pinned)
+        lines.append(f"  [{index}] {layout.page_path.name}")
+        lines.append(f"      路徑: {layout.page_path}")
+        lines.append(
+            f"      版面: {layout.src_canvas[0]}x{layout.src_canvas[1]} → "
+            f"{layout.canvas[0]}x{layout.canvas[1]}"
+            f"（面積 {layout.area_ratio() * 100:.0f}%）"
+        )
+        lines.append(
+            f"      元件: {len(layout.placements)} 個、{scale_text}"
+            + (f"、固定位置 {pinned} 個" if pinned else "")
+        )
+        lines.append(f"      排版: 間距 {layout.padding}px、畫布 {_align_text(layout.align)}")
+        lines.append("")
+    return lines
+
+
+def _project_block(index: int, project: SpineProject, layouts: LayoutStore | None = None) -> list[str]:
     lines = [f"  [{index}] {project.name}"]
     if project.skeleton_path is not None:
         version = f"（Spine {project.spine_version}）" if project.spine_version else ""
@@ -150,16 +190,28 @@ def _project_block(index: int, project: SpineProject) -> list[str]:
             if resolved in seen:
                 continue
             seen.add(resolved)
-            lines.append(f"      貼圖 : {path.name}")
+            layout = layouts.get(path) if layouts is not None else None
+            mark = "（自訂合圖版面）" if layout is not None else ""
+            lines.append(f"      貼圖 : {path.name}{mark}")
             lines.append(f"             路徑: {resolved}")
             page = estimate.page(path.name) if estimate is not None else None
             if page is not None:
                 src_w, src_h = page.src_size
                 dst_w, dst_h = page.dst_size
-                edge = f"{dst_w / src_w:.1%}" if src_w else "—"
-                lines.append(
-                    f"             尺寸: {src_w}x{src_h} → {dst_w}x{dst_h}（長寬各 {edge}）"
-                )
+                if layout is not None:
+                    scale = layout.uniform_scale
+                    detail = (
+                        f"整組 {scale * 100:g}%" if scale is not None else "各元件不同比例"
+                    )
+                    lines.append(
+                        f"             尺寸: {src_w}x{src_h} → {dst_w}x{dst_h}"
+                        f"（重新排版，{len(layout.placements)} 個元件、{detail}）"
+                    )
+                else:
+                    edge = f"{dst_w / src_w:.1%}" if src_w else "—"
+                    lines.append(
+                        f"             尺寸: {src_w}x{src_h} → {dst_w}x{dst_h}（長寬各 {edge}）"
+                    )
                 lines.append(
                     f"             容量: {format_bytes(page.src_bytes)} → 預估 "
                     f"{format_bytes(page.est_bytes)}（{_pct(page.src_bytes, page.est_bytes)}）"
@@ -176,6 +228,7 @@ def build_settings_log(
     projects: list[SpineProject],
     total_count: int | None = None,
     stamp: datetime | None = None,
+    layouts: LayoutStore | None = None,
 ) -> str:
     """
     產生設定紀錄文字。
@@ -184,6 +237,7 @@ def build_settings_log(
         projects: 已套用設定的專案
         total_count: 清單中的專案總數（用來標示有多少份未套用）
         stamp: 產生時間
+        layouts: 合圖版面庫（有版面的貼圖會另外列出並標示）
     """
     stamp = stamp or datetime.now()
     applied = [p for p in projects if p.applied_options is not None]
@@ -208,6 +262,9 @@ def build_settings_log(
             f"（{_pct(src_total, est_total)}）{note}"
         )
         lines.append("　　　　　　（共用貼圖只計一次，與實際寫出的檔案量一致）")
+
+    if layouts is not None and len(layouts):
+        lines.append(f"自訂合圖版面: {len(layouts)} 張（詳見下方獨立區塊）")
 
     if not applied:
         lines.append("")
@@ -238,8 +295,11 @@ def build_settings_log(
         lines.append("")
         lines.append(f"套用的專案（{len(members)} 份）:")
         for index, project in enumerate(members, start=1):
-            lines.extend(_project_block(index, project))
+            lines.extend(_project_block(index, project, layouts))
             lines.append("")
+
+    if layouts is not None:
+        lines.extend(_layout_block(layouts))
 
     return "\n".join(lines)
 
@@ -248,10 +308,13 @@ def write_settings_log(
     projects: list[SpineProject],
     path: Path,
     total_count: int | None = None,
+    layouts: LayoutStore | None = None,
 ) -> Path:
     """寫出設定紀錄，回傳實際路徑。"""
     stamp = datetime.now()
     path.parent.mkdir(parents=True, exist_ok=True)
     # utf-8-sig：Windows 上用記事本或 Excel 開啟時中文才不會變亂碼
-    path.write_text(build_settings_log(projects, total_count, stamp), encoding="utf-8-sig")
+    path.write_text(
+        build_settings_log(projects, total_count, stamp, layouts), encoding="utf-8-sig"
+    )
     return path

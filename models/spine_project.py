@@ -6,6 +6,7 @@ from pathlib import Path
 
 from core.skeleton_reader import SkeletonInfo
 from models.process_options import ProcessOptions
+from models.size_estimate import SizeEstimate
 from models.spine_asset import SpineAsset
 
 STATUS_IDLE = "idle"          # 尚未套用設定
@@ -27,9 +28,8 @@ class SpineProject:
     applied_options: ProcessOptions | None = None
     status: str = STATUS_IDLE
     status_detail: str = ""
-    # 套用後由 PreviewWorker 產生的檔案大小預估：
-    # {"fingerprint": tuple, "pages": [...], "src_total": int, "est_total": int}
-    size_estimate: dict | None = None
+    # 套用後由 PreviewWorker / EstimateWorker 算出的處理後容量預估
+    size_estimate: SizeEstimate | None = None
 
     @property
     def name(self) -> str:

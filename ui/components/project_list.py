@@ -11,9 +11,18 @@ from PyQt6.QtWidgets import (
 )
 
 from models.spine_project import SpineProject
-from utils.file_utils import format_bytes
+from ui.styles.theme import DELTA_DOWN_COLOUR, DELTA_UP_COLOUR
+from utils.file_utils import format_bytes, format_size_delta
 
-_COLUMNS = ("名稱", "Spine", "頁面尺寸", "區塊", "貼圖", "狀態")
+_COLUMNS = ("名稱", "Spine", "頁面尺寸", "區塊", "貼圖", "狀態", "容量變化")
+_COL_DELTA = len(_COLUMNS) - 1
+
+# 明確欄寬（名稱欄吃掉剩餘空間）。改用固定值而非 ResizeToContents：
+# 七個欄位靠內容自動撐開會超出面板寬度，而且內容變動時欄位會左右跳動。
+# 寬度依 13px Segoe UI 下最長內容推算：
+#   Spine「3.8.99」/ 頁面尺寸「1204x1053」/ 貼圖「709.4 KB」
+#   狀態「已套用 100%」/ 容量變化「1023.9 KB ↓100.0%」
+_COL_WIDTHS = {1: 52, 2: 82, 3: 42, 4: 72, 5: 92, _COL_DELTA: 128}
 
 
 class ProjectList(QTableWidget):
@@ -32,9 +41,9 @@ class ProjectList(QTableWidget):
 
         header = self.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for col in range(1, len(_COLUMNS) - 1):
-            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(len(_COLUMNS) - 1, QHeaderView.ResizeMode.Stretch)
+        for col, width in _COL_WIDTHS.items():
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+            header.resizeSection(col, width)
 
         self.itemSelectionChanged.connect(
             lambda: self.selection_changed.emit(self.current_project())
@@ -71,6 +80,24 @@ class ProjectList(QTableWidget):
         if project.warnings:
             status.setToolTip("\n".join(project.warnings))
         self.setItem(row, 5, status)
+        self.setItem(row, _COL_DELTA, self._delta_item(project))
+
+    @staticmethod
+    def _delta_item(project: SpineProject) -> QTableWidgetItem:
+        """容量變化欄：已套用才有值，估算完成前顯示「估算中…」"""
+        estimate = project.size_estimate
+        if estimate is None or not estimate.pages:
+            item = QTableWidgetItem("估算中…" if project.applied_options is not None else "—")
+            item.setForeground(QColor("#94A3B8"))
+            return item
+        text, increased = format_size_delta(estimate.src_total, estimate.est_total)
+        item = QTableWidgetItem(text)
+        item.setForeground(QColor(DELTA_UP_COLOUR if increased else DELTA_DOWN_COLOUR))
+        item.setToolTip(
+            f"原始 {format_bytes(estimate.src_total)} → 處理後 {format_bytes(estimate.est_total)}"
+            f"（{len(estimate.pages)} 張貼圖）"
+        )
+        return item
 
     def refresh_project(self, project: SpineProject) -> None:
         try:

@@ -425,13 +425,15 @@ class SettingsPanel(QScrollArea):
         card, layout = self._make_card("📤 輸出")
         layout.setSpacing(6)
 
+        self.out_inplace = QRadioButton("覆蓋原檔")
         self.out_subfolder = QRadioButton("輸出到子資料夾")
         self.out_custom = QRadioButton("輸出到指定路徑")
-        self.out_inplace = QRadioButton("原地覆蓋（會先建立 .bak 備份）")
         self.output_group = QButtonGroup(self)
-        for button in (self.out_subfolder, self.out_custom, self.out_inplace):
+        for button in (self.out_inplace, self.out_subfolder, self.out_custom):
             self.output_group.addButton(button)
-        self.out_subfolder.setChecked(True)
+        self.out_inplace.setChecked(True)
+
+        layout.addWidget(self.out_inplace)
 
         sub_row = QHBoxLayout()
         sub_row.setSpacing(6)
@@ -456,8 +458,6 @@ class SettingsPanel(QScrollArea):
         custom_row.addWidget(self.output_edit, 1)
         custom_row.addWidget(browse)
         layout.addLayout(custom_row)
-
-        layout.addWidget(self.out_inplace)
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)

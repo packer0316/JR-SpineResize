@@ -28,19 +28,20 @@ def format_bytes(size: float) -> str:
     return f"{size:.1f} GB"
 
 
-def backup_once(path: Path) -> Path | None:
+def format_size_delta(src_bytes: int, est_bytes: int) -> tuple[str, bool]:
     """
-    覆寫原檔前先備份一次。
+    「處理後大小 + 增減百分比」的顯示字串（與 JR-Img-Compresser 同格式）。
 
-    已經有 .bak 就不再覆蓋，避免第二次執行把「原始檔的備份」換成「已處理檔的備份」。
+    Returns:
+        (例如 ``137.5 KB ↓80.6%``, 是否變大)
     """
-    if not path.exists():
-        return None
-    backup = path.with_suffix(path.suffix + ".bak")
-    if backup.exists():
-        return backup
-    shutil.copy2(path, backup)
-    return backup
+    text = format_bytes(est_bytes)
+    if src_bytes <= 0:
+        return text, True
+    pct = (est_bytes - src_bytes) / src_bytes * 100.0
+    if pct > 0.05:
+        return f"{text} ↑{pct:.1f}%", True
+    return f"{text} ↓{-pct:.1f}%", False
 
 
 def copy_file(src: Path, dst: Path) -> None:

@@ -9,13 +9,15 @@ Spine 播放器元件
 """
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 
 from PIL import Image
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QTransform
+from PyQt6.QtCore import QPointF, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QIcon, QPainter, QPen, QTransform
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -32,9 +34,18 @@ from core.spine.qt_renderer import SkeletonRenderer
 from core.spine.runtime import Skeleton
 from core.spine.texture_store import AtlasTextureStore
 from models.atlas_data import AtlasFile
+from ui.styles.indicators import pause_icon, play_icon
 
 _FPS = 30
 _SETUP_POSE = "（Setup Pose）"
+
+# 深底視圖上的中性圖示色，兩種主題皆可讀
+_ICON_COLOUR = "#8A93A5"
+
+# 格線與座標軸配色（視圖底色固定深灰，不隨主題）
+_GRID_COLOUR = QColor(56, 60, 70)
+_AXIS_X_COLOUR = QColor(158, 96, 96)   # X 軸（y = 0）
+_AXIS_Y_COLOUR = QColor(96, 150, 96)   # Y 軸（x = 0）
 
 
 class _Viewport(QWidget):
@@ -48,6 +59,7 @@ class _Viewport(QWidget):
         self.zoom = 1.0
         self.center_x = 0.0
         self.center_y = 0.0
+        self.show_grid = True
         self._fitted = False
         self._drag_start = None
         self.setMinimumHeight(220)
@@ -88,11 +100,53 @@ class _Viewport(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.message)
             painter.end()
             return
+        if self.show_grid:
+            self._draw_grid(painter)
         painter.setTransform(self.view_transform())
         self.renderer.render(painter, self.skeleton)
         painter.end()
         if not self._fitted and self.renderer.last_bounds is not None:
             self.fit()
+
+    def _draw_grid(self, painter: QPainter) -> None:
+        """世界座標格線 + X/Y 軸。以螢幕座標畫線，維持 1px 銳利。"""
+        half_w = (self.width() / 2) / self.zoom
+        half_h = (self.height() / 2) / self.zoom
+        world_x0 = self.center_x - half_w
+        world_x1 = self.center_x + half_w
+        world_y0 = self.center_y - half_h
+        world_y1 = self.center_y + half_h
+
+        # 間距取 1/2/5 x 10^n，讓螢幕上約 60~150px 一格
+        target = 60.0 / self.zoom
+        exponent = math.floor(math.log10(max(target, 1e-9)))
+        step = 10.0 ** exponent
+        for mult in (1.0, 2.0, 5.0, 10.0):
+            if 10.0 ** exponent * mult >= target:
+                step = 10.0 ** exponent * mult
+                break
+
+        view = self.view_transform()
+
+        def draw_world_line(wx0: float, wy0: float, wx1: float, wy1: float) -> None:
+            painter.drawLine(view.map(QPointF(wx0, wy0)), view.map(QPointF(wx1, wy1)))
+
+        painter.setPen(QPen(_GRID_COLOUR, 1))
+        for i in range(math.floor(world_x0 / step), math.ceil(world_x1 / step) + 1):
+            if i == 0:
+                continue  # 軸線最後以強調色再畫
+            draw_world_line(i * step, world_y0, i * step, world_y1)
+        for j in range(math.floor(world_y0 / step), math.ceil(world_y1 / step) + 1):
+            if j == 0:
+                continue
+            draw_world_line(world_x0, j * step, world_x1, j * step)
+
+        if world_y0 <= 0 <= world_y1:
+            painter.setPen(QPen(_AXIS_X_COLOUR, 1))
+            draw_world_line(world_x0, 0, world_x1, 0)
+        if world_x0 <= 0 <= world_x1:
+            painter.setPen(QPen(_AXIS_Y_COLOUR, 1))
+            draw_world_line(0, world_y0, 0, world_y1)
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         if self.skeleton is None:
@@ -155,8 +209,12 @@ class SpinePlayer(QWidget):
         bar.addWidget(self.skin_label)
         bar.addWidget(self.skin_combo, 1)
 
-        self.play_button = QPushButton("暫停")
-        self.play_button.setFixedWidth(56)
+        self._icon_play = QIcon(play_icon(_ICON_COLOUR))
+        self._icon_pause = QIcon(pause_icon(_ICON_COLOUR))
+        self.play_button = QPushButton()
+        self.play_button.setIcon(self._icon_pause)
+        self.play_button.setFixedWidth(36)
+        self.play_button.setToolTip("播放 / 暫停")
         self.play_button.clicked.connect(self.toggle_play)
         bar.addWidget(self.play_button)
 
@@ -172,6 +230,12 @@ class SpinePlayer(QWidget):
         fit_button.setFixedWidth(52)
         fit_button.clicked.connect(lambda: self.viewport.fit())
         bar.addWidget(fit_button)
+
+        self.grid_check = QCheckBox("格線")
+        self.grid_check.setChecked(True)
+        self.grid_check.setToolTip("顯示座標軸與格線")
+        self.grid_check.toggled.connect(self._on_grid_toggled)
+        bar.addWidget(self.grid_check)
         layout.addLayout(bar)
 
         # ---- 繪製區
@@ -257,7 +321,7 @@ class SpinePlayer(QWidget):
         self._current_animation = self._animations[0] if self._animations else None
         self._time = 0.0
         self._playing = True
-        self.play_button.setText("暫停")
+        self.play_button.setIcon(self._icon_pause)
         self._last_tick = time.perf_counter()
         self._timer.start()
         self._apply_pose()
@@ -294,8 +358,12 @@ class SpinePlayer(QWidget):
 
     def toggle_play(self) -> None:
         self._playing = not self._playing
-        self.play_button.setText("暫停" if self._playing else "播放")
+        self.play_button.setIcon(self._icon_pause if self._playing else self._icon_play)
         self._last_tick = time.perf_counter()
+
+    def _on_grid_toggled(self, checked: bool) -> None:
+        self.viewport.show_grid = checked
+        self.viewport.update()
 
     def _duration(self) -> float:
         return self._current_animation.duration if self._current_animation else 0.0

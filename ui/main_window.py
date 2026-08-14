@@ -20,9 +20,10 @@ from PyQt6.QtWidgets import (
 )
 
 from config import settings as user_settings
-from config.constants import APP_NAME, APP_TITLE, OUTPUT_CUSTOM, OUTPUT_INPLACE
+from config.constants import APP_NAME, APP_TITLE, OUTPUT_CUSTOM
 from config.version import VERSION
 from core.pipeline import BatchResult
+from models.size_estimate import aggregate_estimates
 from models.spine_project import STATUS_APPLIED, STATUS_IDLE, SpineProject
 from ui.components.project_detail import ProjectDetail
 from ui.components.project_list import ProjectList
@@ -30,8 +31,9 @@ from ui.components.settings_panel import SettingsPanel
 from ui.dialogs.about_dialog import AboutDialog
 from ui.dialogs.progress_dialog import ProgressDialog
 from ui.dialogs.report_dialog import ReportDialog
-from ui.styles.theme import THEMES, build_stylesheet
-from ui.workers import PreviewWorker, ProcessWorker, ScanWorker
+from ui.styles.theme import DELTA_DOWN_COLOUR, DELTA_UP_COLOUR, THEMES, build_stylesheet
+from ui.workers import EstimateWorker, PreviewWorker, ProcessWorker, ScanWorker
+from utils.file_utils import format_bytes
 
 
 class MainWindow(QMainWindow):
@@ -44,6 +46,7 @@ class MainWindow(QMainWindow):
         self._scan_worker: ScanWorker | None = None
         self._process_worker: ProcessWorker | None = None
         self._preview_workers: list[PreviewWorker] = []
+        self._estimate_worker: EstimateWorker | None = None
         self._progress: ProgressDialog | None = None
         self._source_roots: list[Path] = []
         # 縮放後貼圖庫快取：id(project) -> (設定指紋, AtlasTextureStore, label)
@@ -89,7 +92,8 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 5)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([460, 560, 420])
+        # 左欄要放得下七個欄位（含容量變化），預設給寬一點免得一開就出現橫向捲軸
+        splitter.setSizes([620, 440, 420])
         splitter.setChildrenCollapsible(False)
         layout.addWidget(splitter, 1)
 
@@ -167,6 +171,11 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("尚未載入任何專案")
         self.status_label.setProperty("role", "hint")
         row.addWidget(self.status_label)
+
+        self.total_label = QLabel("")
+        self.total_label.setProperty("role", "stat")
+        row.addSpacing(12)
+        row.addWidget(self.total_label)
         row.addStretch(1)
 
         self.start_button = QPushButton("開始處理")
@@ -177,7 +186,7 @@ class MainWindow(QMainWindow):
         return row
 
     def _apply_theme(self, key: str) -> None:
-        self.setStyleSheet(build_stylesheet(THEMES.get(key, THEMES["light"])))
+        self.setStyleSheet(build_stylesheet(THEMES.get(key, THEMES["dark"])))
         user_settings.save_theme(key)
 
     # ------------------------------------------------------------ 載入
@@ -240,6 +249,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP_NAME, "找不到任何 .skel 或 .atlas 檔案。")
 
     def _clear(self) -> None:
+        if self._estimate_worker is not None and self._estimate_worker.isRunning():
+            self._estimate_worker.cancel()
         self.project_list.clear_projects()
         self._source_roots.clear()
         self._preview_cache.clear()
@@ -271,7 +282,11 @@ class MainWindow(QMainWindow):
             self.detail.player.set_scaled_store(cached[1], cached[2])
             return
         worker = PreviewWorker(project, copy.deepcopy(options), self)
-        worker.built.connect(self._on_preview_built)
+        # 以 worker 當時的設定當快取鍵——產生期間設定又被改過的話，
+        # 這份結果就是過期的，不能用新指紋存進快取
+        worker.built.connect(
+            lambda p, store, label, f=fingerprint: self._on_preview_built(p, store, label, f)
+        )
         worker.estimated.connect(self._on_estimate_ready)
         worker.failed.connect(self._on_preview_failed)
         worker.finished.connect(lambda w=worker: self._preview_workers.remove(w) if w in self._preview_workers else None)
@@ -279,10 +294,11 @@ class MainWindow(QMainWindow):
         worker.start()
         self.detail.preview_hint.setText("正在產生縮放後預覽…")
 
-    def _on_preview_built(self, project, store, label) -> None:
+    def _on_preview_built(self, project, store, label, fingerprint: tuple) -> None:
         options = project.applied_options
-        if options is not None:
-            self._preview_cache[id(project)] = (self._options_fingerprint(options), store, label)
+        if options is None or fingerprint != self._options_fingerprint(options):
+            return
+        self._preview_cache[id(project)] = (fingerprint, store, label)
         if self.project_list.current_project() is project:
             self.detail.player.set_scaled_store(store, label)
             self.detail.preview_hint.setText(
@@ -293,15 +309,41 @@ class MainWindow(QMainWindow):
         if self.project_list.current_project() is project:
             self.detail.preview_hint.setText(f"縮放後預覽不可用：{message}")
 
-    def _on_estimate_ready(self, project, estimate: dict) -> None:
-        """PreviewWorker 完成壓縮估算：記到專案並更新畫面（原始 vs 處理後大小差距）"""
+    def _on_estimate_ready(self, project, estimate) -> None:
+        """估算完成：記到專案，更新清單的容量變化欄與詳細面板"""
         options = project.applied_options
         # 估算期間設定可能又被改過，過期結果直接丟棄
-        if options is None or estimate.get("fingerprint") != self._options_fingerprint(options):
+        if options is None or estimate.fingerprint != self._options_fingerprint(options):
             return
         project.size_estimate = estimate
+        self.project_list.refresh_project(project)
         if self.project_list.current_project() is project:
             self.detail.apply_estimate(project)
+        self._update_footer()
+
+    def _start_estimates(self) -> None:
+        """為所有已套用但還沒有（或已過期）估算的專案排背景估算"""
+        jobs = []
+        for project in self.project_list.projects:
+            options = project.applied_options
+            if options is None or not project.can_process:
+                continue
+            estimate = project.size_estimate
+            if estimate is not None and estimate.fingerprint == self._options_fingerprint(options):
+                continue  # 這份的估算還是新的
+            # 已經有 PreviewWorker 在算這份（它會順便回報估算），不重複跑
+            if any(w.project is project for w in self._preview_workers):
+                continue
+            jobs.append((project, copy.deepcopy(options)))
+        if not jobs:
+            return
+        if self._estimate_worker is not None and self._estimate_worker.isRunning():
+            self._estimate_worker.cancel()
+            self._estimate_worker.wait(2000)
+        worker = EstimateWorker(jobs, self)
+        worker.estimated.connect(self._on_estimate_ready)
+        self._estimate_worker = worker
+        worker.start()
 
     def _apply_current(self) -> None:
         project = self.project_list.current_project()
@@ -353,12 +395,14 @@ class MainWindow(QMainWindow):
     def _after_apply(self) -> None:
         self.project_list.refresh_all()
         self._update_footer()
+        self._start_estimates()
         user_settings.save_options(self.settings_panel.get_options())
 
     def _update_footer(self) -> None:
         projects = self.project_list.projects
         if not projects:
             self.status_label.setText("尚未載入任何專案")
+            self.total_label.setText("")
             self.start_button.setText("開始處理")
             self.start_button.setEnabled(False)
             return
@@ -371,8 +415,28 @@ class MainWindow(QMainWindow):
         self.status_label.setText(
             f"已載入 {len(projects)} 份專案，已套用 {len(applied)} 份{skipped_hint}"
         )
+        self._update_total_label(applied)
         self.start_button.setText(f"開始處理（{len(applied)}）" if applied else "開始處理")
         self.start_button.setEnabled(bool(applied))
+
+    def _update_total_label(self, applied: list[SpineProject]) -> None:
+        """已套用專案的容量總計；估算還沒跑完就先標示進度"""
+        estimated = [p for p in applied if p.size_estimate is not None]
+        if not estimated:
+            self.total_label.setText("估算容量中…" if applied else "")
+            self.total_label.setStyleSheet("")
+            return
+        # 跨專案共用的貼圖只算一次，否則會高估節省量
+        src_total, est_total = aggregate_estimates(p.size_estimate for p in estimated)
+        delta = est_total - src_total
+        pending = len(applied) - len(estimated)
+        suffix = f"，另 {pending} 份估算中…" if pending else ""
+        if delta <= 0:
+            self.total_label.setText(f"預估節省 {format_bytes(-delta)}{suffix}")
+            self.total_label.setStyleSheet(f"color: {DELTA_DOWN_COLOUR};")
+        else:
+            self.total_label.setText(f"預估增加 {format_bytes(delta)}{suffix}")
+            self.total_label.setStyleSheet(f"color: {DELTA_UP_COLOUR};")
 
     # ------------------------------------------------------------ 處理
 
@@ -387,15 +451,6 @@ class MainWindow(QMainWindow):
             assert options is not None
             if options.output_mode == OUTPUT_CUSTOM and not options.output_dir:
                 QMessageBox.warning(self, APP_NAME, f"{project.name}：輸出到指定路徑，但尚未選擇資料夾。")
-                return
-        if any(p.applied_options.output_mode == OUTPUT_INPLACE for p in applied):
-            answer = QMessageBox.question(
-                self, APP_NAME,
-                "部分專案使用「原地覆蓋」，會直接改寫原始檔（會先建立 .bak 備份）。\n確定要繼續嗎？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
                 return
 
         self._progress = ProgressDialog("處理中", self)
@@ -423,7 +478,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.detail.player.stop()
-        for worker in (self._scan_worker, self._process_worker, *self._preview_workers):
+        for worker in (self._scan_worker, self._process_worker,
+                       self._estimate_worker, *self._preview_workers):
             if worker is not None and worker.isRunning():
                 if hasattr(worker, "cancel"):
                     worker.cancel()

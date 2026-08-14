@@ -12,7 +12,7 @@ from config.constants import (
     DEFAULT_SCALE_PERCENT,
     DEFAULT_SUBFOLDER_NAME,
     MODE_RESCALE,
-    OUTPUT_SUBFOLDER,
+    OUTPUT_INPLACE,
     PAGE_ALIGN_NONE,
 )
 from models.compression_options import CompressionOptions
@@ -47,7 +47,7 @@ class ProcessOptions:
     derive_scale_from_image: bool = True
 
     # ---- 輸出 ----------------------------------------------------------
-    output_mode: str = OUTPUT_SUBFOLDER
+    output_mode: str = OUTPUT_INPLACE
     output_dir: Path | None = None
     subfolder_name: str = DEFAULT_SUBFOLDER_NAME
     filename_suffix: str = ""

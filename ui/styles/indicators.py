@@ -60,6 +60,44 @@ def radio_dot_icon(color: str) -> str:
     return out.as_posix()
 
 
+def play_icon(color: str) -> str:
+    """播放三角形圖示（透明底）"""
+    key = color.lstrip("#")
+    out = _CACHE_DIR / f"play_{_VERSION}_{key}.png"
+    if not out.exists():
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        s = _SIZE * _SCALE
+        img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        rgb = _hex_to_rgb(color)
+        # 三角形視覺重心偏左，稍微右移置中
+        left, right = s * 0.32, s * 0.78
+        top, bottom = s * 0.22, s * 0.78
+        draw.polygon([(left, top), (right, s / 2), (left, bottom)], fill=rgb)
+        img.resize((_SIZE, _SIZE), Image.Resampling.LANCZOS).save(out)
+    return out.as_posix()
+
+
+def pause_icon(color: str) -> str:
+    """暫停雙直條圖示（透明底）"""
+    key = color.lstrip("#")
+    out = _CACHE_DIR / f"pause_{_VERSION}_{key}.png"
+    if not out.exists():
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        s = _SIZE * _SCALE
+        img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        rgb = _hex_to_rgb(color)
+        top, bottom = s * 0.22, s * 0.78
+        bar_w = s * 0.16
+        gap = s * 0.14
+        cx = s / 2
+        draw.rectangle([cx - gap / 2 - bar_w, top, cx - gap / 2, bottom], fill=rgb)
+        draw.rectangle([cx + gap / 2, top, cx + gap / 2 + bar_w, bottom], fill=rgb)
+        img.resize((_SIZE, _SIZE), Image.Resampling.LANCZOS).save(out)
+    return out.as_posix()
+
+
 def arrow_icon(color: str, direction: str) -> str:
     """下拉/上下箭頭圖示（direction: up / down）"""
     key = f"{direction}_{color.lstrip('#')}"

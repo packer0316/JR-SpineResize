@@ -76,6 +76,10 @@ DARK = Palette(
 
 THEMES = {"light": LIGHT, "dark": DARK}
 
+# 表格內以 QColor 直接上色的容量變化（兩種主題共用，綠降紅升）
+DELTA_DOWN_COLOUR = "#16a34a"
+DELTA_UP_COLOUR = "#dc2626"
+
 
 def build_stylesheet(p: Palette) -> str:
     check_url = checkmark_icon(p.primary)

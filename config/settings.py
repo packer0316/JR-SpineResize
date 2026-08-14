@@ -16,7 +16,7 @@ from config.constants import (
     DEFAULT_SUBFOLDER_NAME,
     MODE_RESCALE,
     ORG_NAME,
-    OUTPUT_SUBFOLDER,
+    OUTPUT_INPLACE,
     PAGE_ALIGN_NONE,
 )
 from models.compression_options import CompressionOptions
@@ -53,7 +53,7 @@ def load_options() -> ProcessOptions:
         compression=compression,
         prescaled_dir=Path(prescaled) if prescaled else None,
         derive_scale_from_image=s.value("scale/derive_from_image", True, type=bool),
-        output_mode=s.value("output/mode", OUTPUT_SUBFOLDER, type=str),
+        output_mode=s.value("output/mode", OUTPUT_INPLACE, type=str),
         output_dir=Path(output_dir) if output_dir else None,
         subfolder_name=s.value("output/subfolder", DEFAULT_SUBFOLDER_NAME, type=str),
         filename_suffix=s.value("output/suffix", "", type=str),
@@ -99,7 +99,7 @@ def save_last_folder(path: str) -> None:
 
 
 def load_theme() -> str:
-    return _settings().value("theme", "light", type=str)
+    return _settings().value("theme", "dark", type=str)
 
 
 def save_theme(name: str) -> None:

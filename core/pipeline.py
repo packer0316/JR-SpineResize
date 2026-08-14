@@ -44,10 +44,12 @@ from core.validator import (
     validate_region_names,
     validate_source_page,
 )
+from models.atlas_data import AtlasFile
 from models.compression_options import CompressionOptions
 from models.process_options import ProcessOptions
+from models.size_estimate import PageEstimate, SizeEstimate
 from models.spine_asset import SpineAsset
-from utils.file_utils import backup_once, copy_file, longest_matching_root
+from utils.file_utils import copy_file, longest_matching_root
 
 ProgressCallback = Callable[[str], None]
 
@@ -164,21 +166,24 @@ def compress_texture(
     return preview, data, describe_encoding(compression, fmt)
 
 
-def _save_texture(
+def _encode_texture(
     image: Image.Image,
     dst_path: Path,
     src_path: Path,
     scale: float,
     compression: CompressionOptions,
-) -> str:
+) -> tuple[bytes | Path, str, int]:
     """
-    壓縮並寫出貼圖，回傳編碼描述。
+    壓縮貼圖但不落地，回傳（寫出負載, 編碼描述, 輸出大小）。
+
+    負載是 bytes（壓縮結果）或 Path（沿用該來源檔）。實際寫出延後到
+    整份資產驗證通過之後——覆蓋模式已不做 .bak，先寫再驗證失敗會把
+    原檔毀掉而無從回復。
 
     絕不變大保護（同 TinyPNG / JR-Img-Compresser 行為）：
     比例 100% 且未做有損/色彩格式量化時，輸出像素與原圖等值——
     若壓縮結果反而比原檔大，直接沿用原檔 bytes。
     """
-    dst_path.parent.mkdir(parents=True, exist_ok=True)
     _, data, encoding = compress_texture(image, dst_path.suffix, compression)
 
     if scale == 1.0 and not compression.alters_pixels:
@@ -187,12 +192,19 @@ def _save_texture(
         except OSError:
             src_bytes = 0
         if src_bytes and len(data) >= src_bytes:
-            if src_path.resolve() != dst_path.resolve():
-                copy_file(src_path, dst_path)
-            return "沿用原檔（壓縮無收益）"
+            return src_path, "沿用原檔（壓縮無收益）", src_bytes
 
-    dst_path.write_bytes(data)
-    return encoding
+    return data, encoding, len(data)
+
+
+def _flush_writes(pending_writes: list[tuple[Path, bytes | Path]]) -> None:
+    """把延後的貼圖寫出全部落地（驗證通過後才呼叫）"""
+    for dst_path, payload in pending_writes:
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(payload, Path):
+            copy_file(payload, dst_path)
+        else:
+            dst_path.write_bytes(payload)
 
 
 # ---------------------------------------------------------------- 主流程
@@ -245,6 +257,10 @@ def process_asset(
         result.elapsed = time.perf_counter() - started
         return result
 
+    # 貼圖先壓縮進記憶體，等整份資產驗證通過才落地——
+    # 覆蓋模式不做備份，先寫再驗證失敗會毀掉原檔
+    pending_writes: list[tuple[Path, bytes | Path]] = []
+
     for page in atlas.pages:
         src_path = asset.pages[page.name]
         assert src_path is not None
@@ -259,8 +275,8 @@ def process_asset(
                 settings=settings,
                 report=result.report,
                 rendered_pages=rendered_pages,
-                in_place=in_place,
                 atlas=atlas,
+                pending_writes=pending_writes,
             )
         except (PageImageError, ProcessError) as exc:
             result.report.add(LEVEL_ERROR, f"[{page.name}] {exc}")
@@ -284,11 +300,10 @@ def process_asset(
         result.elapsed = time.perf_counter() - started
         return result
 
-    # ---- 寫出 atlas -------------------------------------------------
+    # ---- 驗證通過，貼圖與 atlas 一起落地（覆蓋模式直接改寫原檔）--------
+    _flush_writes(pending_writes)
     atlas_name = _output_name(asset.atlas_path.name, options.filename_suffix)
     atlas_out = out_dir / atlas_name
-    if in_place:
-        backup_once(atlas_out)
     write_atlas_file(atlas, atlas_out)
     result.atlas_out = atlas_out
 
@@ -311,8 +326,8 @@ def _process_page(
     settings: RenderSettings,
     report: ValidationReport,
     rendered_pages: dict[Path, Path],
-    in_place: bool,
     atlas,
+    pending_writes: list[tuple[Path, bytes | Path]],
 ) -> PageOutput | None:
     """處理單一頁面：算出縮放比例、產生新貼圖、把座標寫回 atlas。"""
     declared = page.size
@@ -349,6 +364,7 @@ def _process_page(
         if cached is not None and cached == (src_path.resolve(), fingerprint):
             reused = True  # 同一批次已經產生過完全相同的貼圖，直接沿用
             encoding = "共用（已產生）"
+            dst_bytes = dst_path.stat().st_size if dst_path.exists() else 0
         else:
             if cached is not None:
                 report.add(
@@ -359,15 +375,14 @@ def _process_page(
             render = render_page(source, mapping, settings)
             for note in render.notes:
                 report.add(LEVEL_INFO, f"[{page.name}] {note}")
-            if in_place:
-                backup_once(dst_path)
-            encoding = _save_texture(
+            payload, encoding, dst_bytes = _encode_texture(
                 render.image,
                 dst_path,
                 src_path,
                 scale,
                 options.compression,
             )
+            pending_writes.append((dst_path, payload))
             rendered_pages[dst_path.resolve()] = (src_path.resolve(), fingerprint)
             reused = False
 
@@ -381,7 +396,7 @@ def _process_page(
             src_size=declared,
             dst_size=canvas,
             src_bytes=src_path.stat().st_size,
-            dst_bytes=dst_path.stat().st_size if dst_path.exists() else 0,
+            dst_bytes=dst_bytes,
             reused=reused,
             source_mode=source_mode,
             encoding=encoding,
@@ -421,7 +436,7 @@ def _process_page(
     apply_page_mapping(mapping)
 
     if scaled_path.resolve() != dst_path.resolve():
-        copy_file(scaled_path, dst_path)
+        pending_writes.append((dst_path, scaled_path))
 
     return PageOutput(
         page_name=page.name,
@@ -457,6 +472,102 @@ def _find_prescaled_page(page_name: str, fallback: Path, options: ProcessOptions
                     return entry
         return None
     return fallback if fallback.is_file() else None
+
+
+# ---------------------------------------------------------------- 預覽與大小估算
+
+
+@dataclass
+class PreviewBuild:
+    """``build_preview`` 的結果"""
+
+    estimate: SizeEstimate
+    # preview_asset 指定時：座標已重算的 atlas 與壓縮後貼圖（供播放器建貼圖庫）
+    atlas: AtlasFile | None = None
+    pages: dict[str, Image.Image] = field(default_factory=dict)
+
+
+def build_preview(
+    assets: list[SpineAsset],
+    options: ProcessOptions,
+    preview_asset: SpineAsset | None = None,
+) -> PreviewBuild:
+    """
+    估算處理後的貼圖大小，必要時一併產生預覽貼圖。
+
+    走與正式輸出完全相同的路徑（build_page_mapping → render_page →
+    compress_texture），只是壓縮用快速模式（oxipng level 1）加速，
+    所以數字與畫面都忠於實際輸出。
+
+    ``preview_asset`` 指定時會保留該 atlas 的壓縮後貼圖；其餘 atlas 只算大小，
+    不留影像（批次估算數十份專案時記憶體才不會爆）。
+
+    Raises:
+        ProcessError: 貼圖實際尺寸與 atlas 宣告不符（可能已經被縮過一次）。
+    """
+    settings = RenderSettings(
+        resample=options.resample,
+        alpha_mode=options.alpha_mode,
+        bleed=options.bleed,
+        bleed_px=options.bleed_px,
+    )
+    scale = options.scale
+    build = PreviewBuild(estimate=SizeEstimate(fingerprint=options.render_fingerprint()))
+    seen_sources: set[Path] = set()
+
+    for asset in assets:
+        if not asset.is_loadable or asset.missing_pages:
+            continue
+        wants_pages = asset is preview_asset
+        atlas = parse_atlas_file(asset.atlas_path)
+
+        for page in atlas.pages:
+            src_path = asset.pages.get(page.name)
+            if src_path is None:
+                continue
+            with Image.open(src_path) as source_img:
+                source = source_img.convert("RGBA")
+            declared = page.size
+            if source.size != declared:
+                raise ProcessError(
+                    f"{page.name} 實際尺寸與 atlas 宣告不符，可能已被縮放過"
+                )
+
+            canvas = (
+                max(1, align_up(round_half_up(declared[0] * scale), options.page_align)),
+                max(1, align_up(round_half_up(declared[1] * scale), options.page_align)),
+            )
+            mapping = build_page_mapping(page, scale, scale, canvas)
+            rendered = render_page(source, mapping, settings).image
+            preview_img, data, _ = compress_texture(
+                rendered, src_path.suffix, options.compression, fast=True
+            )
+            apply_page_mapping(mapping)
+            if wants_pages:
+                build.pages[page.name] = preview_img.convert("RGBA")
+
+            key = src_path.resolve()
+            if key in seen_sources:
+                continue  # 多份 atlas 共用同一張貼圖，容量只計一次
+            seen_sources.add(key)
+
+            src_bytes = src_path.stat().st_size if src_path.exists() else 0
+            est_bytes = len(data)
+            # 與 _encode_texture 的「絕不變大保護」一致
+            if scale == 1.0 and not options.compression.alters_pixels and src_bytes:
+                est_bytes = min(est_bytes, src_bytes)
+            build.estimate.pages.append(PageEstimate(
+                src_path=key,
+                src_bytes=src_bytes,
+                est_bytes=est_bytes,
+                src_size=declared,
+                dst_size=canvas,
+            ))
+
+        if wants_pages:
+            build.atlas = atlas
+
+    return build
 
 
 def process_batch(

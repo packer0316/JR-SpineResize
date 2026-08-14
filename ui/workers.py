@@ -1,17 +1,13 @@
-"""背景執行緒：掃描、處理、縮放預覽建構，都不阻塞介面"""
+"""背景執行緒：掃描、處理、預覽建構與容量估算，都不阻塞介面"""
 from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from config.constants import MODE_RESCALE
-from core.atlas_parser import parse_atlas_file
-from core.page_renderer import RenderSettings, render_page
-from core.pipeline import BatchResult, compress_texture, process_asset
+from core.pipeline import BatchResult, build_preview, process_asset
 from core.project_scanner import scan_projects
-from core.rect_mapper import align_up, apply_page_mapping, build_page_mapping, round_half_up
 from core.spine.texture_store import AtlasTextureStore
 from models.process_options import ProcessOptions
 from models.spine_project import STATUS_DONE, STATUS_FAILED, SpineProject
@@ -83,26 +79,29 @@ class ProcessWorker(QThread):
         self.finished_process.emit(batch, skipped)
 
 
+def _preview_label(options: ProcessOptions) -> str:
+    return f"{options.scale_percent:g}%" if options.resize_enabled else "壓縮後"
+
+
 class PreviewWorker(QThread):
     """
-    依套用的設定在記憶體中產生「縮放後」貼圖庫，供播放器切換對比，
-    並順便以壓縮引擎（快速模式）估算每張貼圖處理後的檔案大小。
+    為選中的專案產生「縮放後」貼圖庫供播放器切換對比，並回報大小估算。
 
-    走與正式處理完全相同的路徑（build_page_mapping / render_page /
-    compress_texture / apply_page_mapping），所以預覽畫面就是輸出結果。
+    實際工作由 ``core.pipeline.build_preview`` 完成——與正式輸出同一條路徑，
+    所以預覽畫面與估算數字都忠於處理結果。
     """
 
     built = pyqtSignal(object, object, str)   # project, AtlasTextureStore, label
-    estimated = pyqtSignal(object, object)    # project, 估算結果 dict
+    estimated = pyqtSignal(object, object)    # project, SizeEstimate
     failed = pyqtSignal(object, str)          # project, error
 
     def __init__(self, project: SpineProject, options: ProcessOptions, parent=None) -> None:
         super().__init__(parent)
-        self._project = project
+        self.project = project  # 公開：呼叫端用來判斷這份是否已在計算中
         self._options = options
 
     def run(self) -> None:
-        project = self._project
+        project = self.project
         options = self._options
         primary = project.primary_atlas
         if primary is None or not primary.is_loadable:
@@ -112,79 +111,44 @@ class PreviewWorker(QThread):
             self.failed.emit(project, "「只重算 atlas」模式不提供縮放預覽")
             return
         try:
-            settings = RenderSettings(
-                resample=options.resample,
-                alpha_mode=options.alpha_mode,
-                bleed=options.bleed,
-                bleed_px=options.bleed_px,
-            )
-            scale = options.scale
-            store = None
-            page_estimates: list[dict] = []
-            seen_paths: set = set()
-
-            for asset in project.atlases:
-                if not asset.is_loadable or asset.missing_pages:
-                    continue
-                atlas = parse_atlas_file(asset.atlas_path)
-                pages: dict[str, Image.Image] = {}
-                for page in atlas.pages:
-                    src_path = asset.pages.get(page.name)
-                    if src_path is None:
-                        continue
-                    with Image.open(src_path) as source_img:
-                        source = source_img.convert("RGBA")
-                    declared = page.size
-                    if source.size != declared:
-                        self.failed.emit(
-                            project,
-                            f"{page.name} 實際尺寸與 atlas 宣告不符，可能已被縮放過",
-                        )
-                        return
-                    canvas = (
-                        max(1, align_up(round_half_up(declared[0] * scale), options.page_align)),
-                        max(1, align_up(round_half_up(declared[1] * scale), options.page_align)),
-                    )
-                    mapping = build_page_mapping(page, scale, scale, canvas)
-                    rendered = render_page(source, mapping, settings).image
-                    # 與正式輸出同一顆壓縮引擎（快速模式）：
-                    # 預覽影像即壓縮後畫面，bytes 長度即預估檔案大小
-                    preview_img, data, _ = compress_texture(
-                        rendered, src_path.suffix, options.compression, fast=True
-                    )
-                    apply_page_mapping(mapping)
-                    if asset is primary:
-                        pages[page.name] = preview_img.convert("RGBA")
-
-                    key = src_path.resolve()
-                    if key in seen_paths:
-                        continue  # 多份 atlas 共用同一張貼圖，只計一次
-                    seen_paths.add(key)
-                    src_bytes = src_path.stat().st_size if src_path.exists() else 0
-                    est_bytes = len(data)
-                    # 與 pipeline 的「絕不變大保護」一致：無縮放且無量化時不會輸出更大的檔案
-                    if scale == 1.0 and not options.compression.alters_pixels and src_bytes:
-                        est_bytes = min(est_bytes, src_bytes)
-                    page_estimates.append({
-                        "name": src_path.name,
-                        "src_bytes": src_bytes,
-                        "est_bytes": est_bytes,
-                        "src_size": declared,
-                        "dst_size": canvas,
-                    })
-
-                if asset is primary:
-                    store = AtlasTextureStore(atlas, pages)
-
-            label = f"{options.scale_percent:g}%" if options.resize_enabled else "壓縮後"
-            if store is not None:
-                self.built.emit(project, store, label)
-            estimate = {
-                "fingerprint": options.render_fingerprint(),
-                "pages": page_estimates,
-                "src_total": sum(p["src_bytes"] for p in page_estimates),
-                "est_total": sum(p["est_bytes"] for p in page_estimates),
-            }
-            self.estimated.emit(project, estimate)
+            build = build_preview(project.atlases, options, preview_asset=primary)
+            if build.atlas is not None:
+                store = AtlasTextureStore(build.atlas, build.pages)
+                self.built.emit(project, store, _preview_label(options))
+            self.estimated.emit(project, build.estimate)
         except Exception as exc:  # noqa: BLE001 - 預覽失敗回報即可
             self.failed.emit(project, str(exc))
+
+
+class EstimateWorker(QThread):
+    """
+    批次估算多份專案處理後的容量（供清單的「容量變化」欄）。
+
+    不保留任何貼圖影像，所以幾十份專案一起估也不會吃掉記憶體；
+    每完成一份就 emit 一次，清單會逐列亮起來。
+    """
+
+    estimated = pyqtSignal(object, object)  # project, SizeEstimate
+    finished_all = pyqtSignal()
+
+    def __init__(self, jobs: list[tuple[SpineProject, ProcessOptions]], parent=None) -> None:
+        super().__init__(parent)
+        self._jobs = jobs
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        for project, options in self._jobs:
+            if self._cancelled:
+                break
+            if options.mode != MODE_RESCALE:
+                continue  # 只重算 atlas：貼圖原樣複製，容量不變
+            try:
+                build = build_preview(project.atlases, options)
+            except Exception:  # noqa: BLE001 - 單一專案估算失敗不影響其他
+                continue
+            if not self._cancelled:
+                self.estimated.emit(project, build.estimate)
+        self.finished_all.emit()

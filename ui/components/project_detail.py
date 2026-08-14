@@ -17,23 +17,14 @@ from PyQt6.QtWidgets import (
 
 from models.spine_project import SpineProject
 from ui.components.spine_player import SpinePlayer
-from utils.file_utils import format_bytes
+from ui.styles.theme import DELTA_DOWN_COLOUR, DELTA_UP_COLOUR
+from utils.file_utils import format_bytes, format_size_delta
 
 _FILE_COLUMNS = ("類型", "檔案", "資訊", "處理後")
 
-# 大小變化的顏色（↓ 綠 / ↑ 紅，與 JR-Img-Compresser 一致）
-_COLOUR_DOWN = "#16a34a"
-_COLOUR_UP = "#dc2626"
 
-
-def _delta_text(src_bytes: int, est_bytes: int) -> tuple[str, str]:
-    """回傳（顯示文字, 顏色）——例如 '48.8 KB ↑1.2%'"""
-    if src_bytes <= 0:
-        return format_bytes(est_bytes), _COLOUR_UP
-    pct = (est_bytes - src_bytes) / src_bytes * 100.0
-    if pct > 0.05:
-        return f"{format_bytes(est_bytes)} ↑{pct:.1f}%", _COLOUR_UP
-    return f"{format_bytes(est_bytes)} ↓{-pct:.1f}%", _COLOUR_DOWN
+def _delta_colour(increased: bool) -> str:
+    return DELTA_UP_COLOUR if increased else DELTA_DOWN_COLOUR
 
 
 class ProjectDetail(QWidget):
@@ -119,37 +110,34 @@ class ProjectDetail(QWidget):
                 self.preview_hint.setText("；".join(skeleton.notes))
 
     def apply_estimate(self, project: SpineProject | None) -> None:
-        """把 PreviewWorker 估算的處理後大小填進檔案表與總結列"""
+        """把估算的處理後大小填進檔案表與總結列"""
         if project is not self._project:
             return
         estimate = project.size_estimate if project is not None else None
-        if not estimate or not estimate.get("pages"):
+        if estimate is None or not estimate.pages:
             self.size_summary.setText("")
             self._clear_estimate_column()
             return
 
-        by_name = {page["name"]: page for page in estimate["pages"]}
         table = self.files_table
         for row in range(table.rowCount()):
             name_item = table.item(row, 1)
             if name_item is None:
                 continue
-            page = by_name.get(name_item.text())
+            page = estimate.page(name_item.text())
             if page is None:
                 continue
-            text, colour = _delta_text(page["src_bytes"], page["est_bytes"])
-            dst_w, dst_h = page["dst_size"]
+            text, increased = format_size_delta(page.src_bytes, page.est_bytes)
+            dst_w, dst_h = page.dst_size
             item = QTableWidgetItem(f"{dst_w}x{dst_h}  {text}")
-            item.setForeground(QColor(colour))
+            item.setForeground(QColor(_delta_colour(increased)))
             table.setItem(row, 3, item)
 
-        src_total = estimate.get("src_total", 0)
-        est_total = estimate.get("est_total", 0)
-        text, colour = _delta_text(src_total, est_total)
+        text, increased = format_size_delta(estimate.src_total, estimate.est_total)
         self.size_summary.setText(
-            f"處理後預估：{format_bytes(src_total)} → {text}"
+            f"處理後預估：{format_bytes(estimate.src_total)} → {text}"
         )
-        self.size_summary.setStyleSheet(f"color: {colour};")
+        self.size_summary.setStyleSheet(f"color: {_delta_colour(increased)};")
 
     def _clear_estimate_column(self) -> None:
         for row in range(self.files_table.rowCount()):

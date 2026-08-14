@@ -249,10 +249,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------ 選擇與套用
 
     def _options_fingerprint(self, options) -> tuple:
-        return (
-            options.mode, options.scale_percent, options.resample, options.alpha_mode,
-            options.bleed, options.bleed_px, options.page_align, options.png_format,
-        )
+        # 涵蓋所有會影響輸出貼圖的欄位（含壓縮設定），避免預覽/估算沿用過期快取
+        return options.render_fingerprint()
 
     def _on_project_selected(self, project: SpineProject | None) -> None:
         self.detail.show_project(project)
@@ -274,6 +272,7 @@ class MainWindow(QMainWindow):
             return
         worker = PreviewWorker(project, copy.deepcopy(options), self)
         worker.built.connect(self._on_preview_built)
+        worker.estimated.connect(self._on_estimate_ready)
         worker.failed.connect(self._on_preview_failed)
         worker.finished.connect(lambda w=worker: self._preview_workers.remove(w) if w in self._preview_workers else None)
         self._preview_workers.append(worker)
@@ -293,6 +292,16 @@ class MainWindow(QMainWindow):
     def _on_preview_failed(self, project, message: str) -> None:
         if self.project_list.current_project() is project:
             self.detail.preview_hint.setText(f"縮放後預覽不可用：{message}")
+
+    def _on_estimate_ready(self, project, estimate: dict) -> None:
+        """PreviewWorker 完成壓縮估算：記到專案並更新畫面（原始 vs 處理後大小差距）"""
+        options = project.applied_options
+        # 估算期間設定可能又被改過，過期結果直接丟棄
+        if options is None or estimate.get("fingerprint") != self._options_fingerprint(options):
+            return
+        project.size_estimate = estimate
+        if self.project_list.current_project() is project:
+            self.detail.apply_estimate(project)
 
     def _apply_current(self) -> None:
         project = self.project_list.current_project()
@@ -323,7 +332,10 @@ class MainWindow(QMainWindow):
         project.applied_options = options
         project.status = STATUS_APPLIED
         project.status_detail = ""
+        project.size_estimate = None  # 設定變了，舊估算作廢
         self._preview_cache.pop(id(project), None)
+        if self.project_list.current_project() is project:
+            self.detail.apply_estimate(project)
 
     def _unapply_current(self) -> None:
         project = self.project_list.current_project()
@@ -331,6 +343,8 @@ class MainWindow(QMainWindow):
             return
         project.applied_options = None
         project.status = STATUS_IDLE
+        project.size_estimate = None
+        self.detail.apply_estimate(project)
         self._preview_cache.pop(id(project), None)
         self.detail.player.set_scaled_store(None, "")
         self.detail.preview_hint.setText("")

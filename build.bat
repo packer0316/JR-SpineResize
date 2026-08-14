@@ -32,6 +32,8 @@ py -3 -m PyInstaller ^
   --specpath "%BUILD_TEMP%" ^
   --hidden-import numpy --collect-submodules numpy ^
   --hidden-import imagequant --collect-all imagequant ^
+  --hidden-import oxipng --collect-all oxipng ^
+  --hidden-import mozjpeg_lossless_optimization --collect-all mozjpeg_lossless_optimization ^
   --exclude-module matplotlib ^
   --exclude-module scipy ^
   --exclude-module tkinter ^

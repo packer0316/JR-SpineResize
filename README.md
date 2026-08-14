@@ -79,7 +79,8 @@ pip install -r requirements.txt
 python main.py
 ```
 
-需求：Python 3.10+、PyQt6、Pillow、numpy、imagequant（可選，沒有會退回 Pillow 內建量化）。
+需求：Python 3.10+、PyQt6、Pillow、numpy、imagequant、pyoxipng、mozjpeg-lossless-optimization
+（後三者是壓縮引擎；缺少時會自動退回 Pillow 內建路徑，功能不減但壓縮率較差）。
 Windows 可直接點 `啟動Spine縮放工具.bat`。
 
 打包成單一 exe：執行 `build.bat`，輸出在 `release\JR-SpineResize.exe`。
@@ -133,31 +134,29 @@ Windows 可直接點 `啟動Spine縮放工具.bat`。
 | **透明處理** | 預設「預乘後縮放」。直通 alpha 的圖直接插值會把透明像素沒有意義的 RGB 混進來，邊緣出現黑邊。`pma: true` 的頁面會自動略過（來源本來就是預乘的）。 |
 | **邊緣填充** | 預設「滲出顏色」2px：把圖塊顏色往外滲到透明區、alpha 維持 0，補掉 GPU Linear 取樣吃到空白的問題，輪廓完全不變。「完整外擴」會連 alpha 一起擴（部分引擎需要）。預乘頁面會自動略過。 |
 | **畫布對齊** | 可補到 4 的倍數或 2 的次方。**只補畫布、不改縮放比例**，所以不影響播放結果。 |
-| **貼圖編碼** | 預設「跟隨來源」。**這是檔案大小的關鍵**，詳見下一節。 |
 | **檔名後綴** | 例如 `_half`，會變成 `xxx_half.atlas` / `xxx_half.png`。 |
 
-### 貼圖編碼 —— 為什麼縮一半檔案可能不減反增
+### 壓縮設定（v1.2 起內建 JR-Img-Compresser 引擎）
 
-如果來源 PNG 已經被 pngquant / TinyPNG / JR-Img-Compresser 壓過，它是 **8-bit 調色盤**（每像素 1 byte）。工具讀進來處理後若存成 32-bit RGBA（每像素 4 byte），**尺寸砍半讓像素數只剩 1/4，但每像素肥了 4 倍，剛好抵銷甚至變大。**
+貼圖輸出直接走與 JR-Img-Compresser 相同的壓縮管線，設定項目與介面也一致，
+不需要再把輸出丟去另一個工具跑第二輪：
 
-| 選項 | 說明 |
+| 設定 | 說明 |
 |---|---|
-| **跟隨來源**（預設） | 來源是調色盤就輸出調色盤（用 imagequant，即 pngquant 核心），否則維持 RGBA |
-| **32-bit RGBA** | 零額外損失，但已量化過的素材會變大；適合之後再交給 JR-Img-Compresser |
-| **8-bit 調色盤** | 檔案最小，對原本全彩的素材是有損的 |
+| **模式** | `無損`（預設）：像素零損失，Pillow 編碼後由 oxipng 重新最佳化；`智慧有損`：imagequant（pngquant 核心，同 TinyPNG）256 色量化，可調品質與漸層抖動 |
+| **色彩格式** | RGBA8888 / RGBA5551 / RGBA4444 / RGB565——模擬引擎 16-bit 貼圖轉檔後的實際畫面，同時大幅縮小檔案；可加開 Bayer 量化抖動減少漸層斷階 |
+| **最佳化強度** | oxipng 等級（快速 / 標準 / 極限） |
+| **移除中繼資料** | 移除 EXIF 等 metadata（保留 ICC） |
+| **目標檔案大小** | 指定 KB 數，二分搜尋符合大小的最高品質（智慧有損模式） |
 
-實測（3 份素材，縮 50%，合計 606.5 KB）：
+另有「絕不變大保護」：比例 100%（尺寸調整關閉）且未做任何量化時，
+若壓縮結果反而比原檔大，會直接沿用原檔（同 TinyPNG 行為）。
 
-| 編碼 | 結果 | 變化 |
-|---|---|---|
-| 跟隨來源（預設） | 278.4 KB | **−54%** |
-| 一律 RGBA | 658.8 KB | +9% |
-| 一律調色盤 | 184.1 KB | −70% |
+「尺寸調整」可以整個關閉——此時比例固定 100%，工具就變成
+「保持尺寸、只壓縮貼圖並原樣保留 atlas 數值」的批次壓縮器。
 
-量化品質（相對於無損 RGBA 輸出的平均色差，滿分 255）：imagequant 約 0.6 ~ 1.6，Pillow 內建的 Fast Octree 約 1.3 ~ 3.5。沒安裝 imagequant 時會自動退回 Fast Octree。
-
-> 介面上不會預估縮放後的檔案大小，只顯示「像素量將降至 N%」——
-> 檔案大小取決於編碼與圖像內容，用面積比推估會嚴重失準。實際數字在處理報告中。
+> **套用設定後**，檔案面板會即時顯示每張貼圖「原始 → 處理後」的大小與
+> 增減百分比（背景以壓縮引擎的快速模式實算，不是用面積比亂猜）。
 
 ### 輸出
 
@@ -240,6 +239,7 @@ JR-SpineResize/
 │   ├── atlas_parser.py        # .atlas 解析與序列化
 │   ├── rect_mapper.py         # 座標重算（核心數學）
 │   ├── page_renderer.py       # 逐圖塊縮放與重繪
+│   ├── compressor.py          # 壓縮引擎（imagequant / oxipng / mozjpeg，同 JR-Img-Compresser）
 │   ├── skeleton_reader.py     # .skel / .json 標頭唯讀解析
 │   ├── validator.py           # 輸出驗證與漂移統計
 │   ├── asset_scanner.py       # atlas 掃描與配對
@@ -291,14 +291,12 @@ py -3 tests/verify.py "D:/game/assets/spine" 50
 
 ## 建議工作流程
 
-**素材原檔是全彩 PNG（還沒壓過）**
+v1.2 起壓縮引擎已內建（與 JR-Img-Compresser 同一套），一律一步到位：
 
-1. **JR-SpineResize**（模式 A，貼圖編碼選 `32-bit RGBA`）縮到目標比例
-2. **JR-Img-Compresser** 對輸出的 PNG 做壓縮
+**要縮尺寸**：模式 A + 尺寸調整開啟，壓縮模式依素材選
+`無損`（要再進引擎轉檔的素材）或 `智慧有損`（直接上線的素材，最小）。
 
-順序不要顛倒：先壓縮再縮放會讓量化過的顏色再經一次插值，畫質損失更大。
+**只要壓縮、不縮尺寸**：關閉「啟用 Resize」即可，atlas 會原樣複製。
 
-**素材已經是壓過的 8-bit PNG（例如已進版控的線上素材）**
-
-直接用 **JR-SpineResize**，貼圖編碼維持預設的 `跟隨來源` 即可，一步到位。
-不需要再跑一次 Img-Compresser——輸出已經是 imagequant 量化過的調色盤 PNG。
+先縮放後壓縮的順序由管線自動保證——縮放發生在編碼之前，
+不會出現「量化過的顏色再經一次插值」的二次劣化。

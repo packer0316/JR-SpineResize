@@ -109,6 +109,57 @@ QLabel[role="stat"] {{
     color: {p.text_secondary};
     font-size: 12px;
 }}
+QLabel[role="cardTitle"] {{
+    font-size: 14px;
+    font-weight: bold;
+}}
+QLabel[role="formLabel"] {{
+    color: {p.text_secondary};
+}}
+QLabel[role="valueLabel"] {{
+    color: {p.primary};
+    font-weight: bold;
+}}
+QLabel[role="accent"] {{
+    color: {p.primary};
+    font-size: 11px;
+}}
+QLabel[role="delta-down"] {{
+    color: {p.ok};
+    font-weight: 600;
+}}
+QLabel[role="delta-up"] {{
+    color: {p.warn};
+    font-weight: 600;
+}}
+
+/* ===== 設定卡片（與 JR-Img-Compresser 同款）===== */
+QFrame#settingsCard {{
+    background-color: {p.bg_panel};
+    border: 1px solid {p.border};
+    border-radius: 10px;
+}}
+QFrame#settingsCard .QWidget {{ background-color: transparent; }}
+QFrame#settingsCard .QFrame {{ background-color: transparent; }}
+QFrame#settingsCard QCheckBox {{ background-color: transparent; }}
+QFrame#settingsCard QRadioButton {{ background-color: transparent; }}
+QFrame#settingsCard QSlider {{ background-color: transparent; }}
+
+/* 快速選擇小按鈕（25% / 50%…） */
+QPushButton[chip="true"] {{
+    background-color: {p.bg_hover};
+    color: {p.text_secondary};
+    border: 1px solid {p.border};
+    border-radius: 4px;
+    font-size: 11px;
+    padding: 2px 4px;
+    min-height: 16px;
+}}
+QPushButton[chip="true"]:hover {{
+    background-color: {p.primary};
+    color: #FFFFFF;
+    border-color: {p.primary};
+}}
 
 /* ===== GroupBox 卡片 ===== */
 QGroupBox {{

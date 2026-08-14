@@ -27,6 +27,9 @@ class SpineProject:
     applied_options: ProcessOptions | None = None
     status: str = STATUS_IDLE
     status_detail: str = ""
+    # 套用後由 PreviewWorker 產生的檔案大小預估：
+    # {"fingerprint": tuple, "pages": [...], "src_total": int, "est_total": int}
+    size_estimate: dict | None = None
 
     @property
     def name(self) -> str:
@@ -97,7 +100,10 @@ class SpineProject:
         if self.status == STATUS_FAILED:
             return f"失敗：{self.status_detail[:30]}" if self.status_detail else "失敗"
         if self.status == STATUS_APPLIED and self.applied_options is not None:
-            return f"已套用 {self.applied_options.scale_percent:g}%"
+            options = self.applied_options
+            if not options.resize_enabled:
+                return "已套用（只壓縮）"
+            return f"已套用 {options.scale_percent:g}%"
         if not self.can_process:
             return self.warnings[0][:36] if self.warnings else "無法處理"
         return "未套用"

@@ -1,4 +1,4 @@
-"""選定專案的詳細面板：檔案清單 + Spine 播放預覽"""
+"""選定專案的詳細面板：檔案清單（含處理後大小預估）+ Spine 播放預覽"""
 from __future__ import annotations
 
 from PIL import Image
@@ -19,7 +19,21 @@ from models.spine_project import SpineProject
 from ui.components.spine_player import SpinePlayer
 from utils.file_utils import format_bytes
 
-_FILE_COLUMNS = ("類型", "檔案", "資訊")
+_FILE_COLUMNS = ("類型", "檔案", "資訊", "處理後")
+
+# 大小變化的顏色（↓ 綠 / ↑ 紅，與 JR-Img-Compresser 一致）
+_COLOUR_DOWN = "#16a34a"
+_COLOUR_UP = "#dc2626"
+
+
+def _delta_text(src_bytes: int, est_bytes: int) -> tuple[str, str]:
+    """回傳（顯示文字, 顏色）——例如 '48.8 KB ↑1.2%'"""
+    if src_bytes <= 0:
+        return format_bytes(est_bytes), _COLOUR_UP
+    pct = (est_bytes - src_bytes) / src_bytes * 100.0
+    if pct > 0.05:
+        return f"{format_bytes(est_bytes)} ↑{pct:.1f}%", _COLOUR_UP
+    return f"{format_bytes(est_bytes)} ↓{-pct:.1f}%", _COLOUR_DOWN
 
 
 class ProjectDetail(QWidget):
@@ -44,9 +58,16 @@ class ProjectDetail(QWidget):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.files_table.setMaximumHeight(150)
         self.files_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         files_layout.addWidget(self.files_table)
+
+        # 套用後的大小預估總結（原始 → 處理後 ± %）
+        self.size_summary = QLabel("")
+        self.size_summary.setProperty("role", "stat")
+        self.size_summary.setWordWrap(True)
+        files_layout.addWidget(self.size_summary)
         layout.addWidget(files_group)
 
         preview_group = QGroupBox("Spine 預覽")
@@ -64,6 +85,7 @@ class ProjectDetail(QWidget):
     def show_project(self, project: SpineProject | None) -> None:
         self._project = project
         self._fill_files(project)
+        self.apply_estimate(project)
         self.preview_hint.setText("")
 
         if project is None:
@@ -96,6 +118,43 @@ class ProjectDetail(QWidget):
             if skeleton is not None and skeleton.notes:
                 self.preview_hint.setText("；".join(skeleton.notes))
 
+    def apply_estimate(self, project: SpineProject | None) -> None:
+        """把 PreviewWorker 估算的處理後大小填進檔案表與總結列"""
+        if project is not self._project:
+            return
+        estimate = project.size_estimate if project is not None else None
+        if not estimate or not estimate.get("pages"):
+            self.size_summary.setText("")
+            self._clear_estimate_column()
+            return
+
+        by_name = {page["name"]: page for page in estimate["pages"]}
+        table = self.files_table
+        for row in range(table.rowCount()):
+            name_item = table.item(row, 1)
+            if name_item is None:
+                continue
+            page = by_name.get(name_item.text())
+            if page is None:
+                continue
+            text, colour = _delta_text(page["src_bytes"], page["est_bytes"])
+            dst_w, dst_h = page["dst_size"]
+            item = QTableWidgetItem(f"{dst_w}x{dst_h}  {text}")
+            item.setForeground(QColor(colour))
+            table.setItem(row, 3, item)
+
+        src_total = estimate.get("src_total", 0)
+        est_total = estimate.get("est_total", 0)
+        text, colour = _delta_text(src_total, est_total)
+        self.size_summary.setText(
+            f"處理後預估：{format_bytes(src_total)} → {text}"
+        )
+        self.size_summary.setStyleSheet(f"color: {colour};")
+
+    def _clear_estimate_column(self) -> None:
+        for row in range(self.files_table.rowCount()):
+            self.files_table.setItem(row, 3, QTableWidgetItem(""))
+
     def _fill_files(self, project: SpineProject | None) -> None:
         table = self.files_table
         table.setRowCount(0)
@@ -112,6 +171,7 @@ class ProjectDetail(QWidget):
             if colour:
                 info_item.setForeground(QColor(colour))
             table.setItem(row, 2, info_item)
+            table.setItem(row, 3, QTableWidgetItem(""))
 
         if project.skeleton_path is not None:
             info = project.spine_version or "無法解析"

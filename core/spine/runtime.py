@@ -584,12 +584,26 @@ class _TransformConstraint:
     def apply(self) -> None:
         if self.rotate_mix == 0 and self.translate_mix == 0 and self.scale_mix == 0 and self.shear_mix == 0:
             return
-        if self.data.local or self.data.relative:
-            # 本工具的素材沒用到 local/relative 模式；為了預覽穩定性採用絕對世界模式的近似
-            pass
-        self._apply_absolute_world()
+        # 四種模式完整對應 spine 3.8 TransformConstraint.update()。
+        # 實務素材大量使用 local 模式做對稱骨骼（例如龍翅膀左右鏡射），
+        # 之前以世界模式近似會讓鏡射側動作錯誤（看起來像只播單邊）。
+        if self.data.local:
+            if self.data.relative:
+                self._apply_relative_local()
+            else:
+                self._apply_absolute_local()
+        else:
+            if self.data.relative:
+                self._apply_relative_world()
+            else:
+                self._apply_absolute_world()
         for bone in self.bones:
             bone.update_descendants()
+
+    @staticmethod
+    def _wrap_deg(r: float) -> float:
+        """Java 版 `r -= (16384 - (int)(16384.499999999996 - r/360)) * 360` 的移植"""
+        return r - (16384 - int(16384.499999999996 - r / 360)) * 360
 
     def _apply_absolute_world(self) -> None:
         data = self.data
@@ -646,6 +660,110 @@ class _TransformConstraint:
                 s = math.sqrt(b * b + d * d)
                 bone.b = math.cos(r) * s
                 bone.d = math.sin(r) * s
+
+    def _apply_relative_world(self) -> None:
+        data = self.data
+        target = self.target
+        ta, tb, tc, td = target.a, target.b, target.c, target.d
+        deg_rad_reflect = _DEG_RAD if ta * td - tb * tc > 0 else -_DEG_RAD
+        offset_rotation = data.offset_rotation * deg_rad_reflect
+        offset_shear_y = data.offset_shear_y * deg_rad_reflect
+
+        for bone in self.bones:
+            if self.rotate_mix != 0:
+                a, b, c, d = bone.a, bone.b, bone.c, bone.d
+                r = math.atan2(tc, ta) + offset_rotation
+                if r > math.pi:
+                    r -= math.pi * 2
+                elif r < -math.pi:
+                    r += math.pi * 2
+                r *= self.rotate_mix
+                cos_r, sin_r = math.cos(r), math.sin(r)
+                bone.a = cos_r * a - sin_r * c
+                bone.b = cos_r * b - sin_r * d
+                bone.c = sin_r * a + cos_r * c
+                bone.d = sin_r * b + cos_r * d
+
+            if self.translate_mix != 0:
+                tx = ta * data.offset_x + tb * data.offset_y + target.world_x
+                ty = tc * data.offset_x + td * data.offset_y + target.world_y
+                bone.world_x += tx * self.translate_mix
+                bone.world_y += ty * self.translate_mix
+
+            if self.scale_mix > 0:
+                s = (math.sqrt(ta * ta + tc * tc) - 1 + data.offset_scale_x) * self.scale_mix + 1
+                bone.a *= s
+                bone.c *= s
+                s = (math.sqrt(tb * tb + td * td) - 1 + data.offset_scale_y) * self.scale_mix + 1
+                bone.b *= s
+                bone.d *= s
+
+            if self.shear_mix > 0:
+                r = math.atan2(td, tb) - math.atan2(tc, ta)
+                if r > math.pi:
+                    r -= math.pi * 2
+                elif r < -math.pi:
+                    r += math.pi * 2
+                b, d = bone.b, bone.d
+                r = math.atan2(d, b) + (r - math.pi / 2 + offset_shear_y) * self.shear_mix
+                s = math.sqrt(b * b + d * d)
+                bone.b = math.cos(r) * s
+                bone.d = math.sin(r) * s
+
+    def _apply_absolute_local(self) -> None:
+        # 注意：官方以 applied transform（ax/arotation…）為準；本 runtime 的
+        # bone.x/rotation 即 timeline 寫入的 local 值，語義相同。
+        data = self.data
+        target = self.target
+        for bone in self.bones:
+            rotation = bone.rotation
+            if self.rotate_mix != 0:
+                r = self._wrap_deg(target.rotation - rotation + data.offset_rotation)
+                rotation += r * self.rotate_mix
+
+            x, y = bone.x, bone.y
+            if self.translate_mix != 0:
+                x += (target.x - x + data.offset_x) * self.translate_mix
+                y += (target.y - y + data.offset_y) * self.translate_mix
+
+            scale_x, scale_y = bone.scale_x, bone.scale_y
+            if self.scale_mix != 0:
+                # 3.8 的原始算式如此（含除以自身 scale），照抄以對齊遊戲內表現
+                if scale_x != 0:
+                    scale_x = (scale_x + (target.scale_x - scale_x + data.offset_scale_x) * self.scale_mix) / scale_x
+                if scale_y != 0:
+                    scale_y = (scale_y + (target.scale_y - scale_y + data.offset_scale_y) * self.scale_mix) / scale_y
+
+            shear_y = bone.shear_y
+            if self.shear_mix != 0:
+                r = self._wrap_deg(target.shear_y - shear_y + data.offset_shear_y)
+                shear_y += r * self.shear_mix
+
+            bone.update_world_transform_with(x, y, rotation, scale_x, scale_y, bone.shear_x, shear_y)
+
+    def _apply_relative_local(self) -> None:
+        data = self.data
+        target = self.target
+        for bone in self.bones:
+            rotation = bone.rotation
+            if self.rotate_mix != 0:
+                rotation += (target.rotation + data.offset_rotation) * self.rotate_mix
+
+            x, y = bone.x, bone.y
+            if self.translate_mix != 0:
+                x += (target.x + data.offset_x) * self.translate_mix
+                y += (target.y + data.offset_y) * self.translate_mix
+
+            scale_x, scale_y = bone.scale_x, bone.scale_y
+            if self.scale_mix != 0:
+                scale_x *= ((target.scale_x - 1 + data.offset_scale_x) * self.scale_mix) + 1
+                scale_y *= ((target.scale_y - 1 + data.offset_scale_y) * self.scale_mix) + 1
+
+            shear_y = bone.shear_y
+            if self.shear_mix != 0:
+                shear_y += (target.shear_y + data.offset_shear_y) * self.shear_mix
+
+            bone.update_world_transform_with(x, y, rotation, scale_x, scale_y, bone.shear_x, shear_y)
 
 
 # ---------------------------------------------------------------- Path 約束

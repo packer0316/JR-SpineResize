@@ -26,13 +26,10 @@ from config.constants import (
     OUTPUT_CUSTOM,
     OUTPUT_INPLACE,
     OUTPUT_SUBFOLDER,
-    PALETTE_COLORS,
-    PNG_FORMAT_MATCH,
-    PNG_FORMAT_PALETTE,
-    PNG_FORMAT_RGBA,
 )
 from core.asset_scanner import resolve_page
 from core.atlas_parser import parse_atlas_file, write_atlas_file
+from core.compressor import Compressor, describe_encoding, format_for_suffix
 from core.exceptions import AtlasParseError, PageImageError, ProcessError
 from core.page_renderer import RenderSettings, render_page
 from core.rect_mapper import align_up, apply_page_mapping, build_page_mapping, round_half_up
@@ -47,10 +44,10 @@ from core.validator import (
     validate_region_names,
     validate_source_page,
 )
+from models.compression_options import CompressionOptions
 from models.process_options import ProcessOptions
 from models.spine_asset import SpineAsset
 from utils.file_utils import backup_once, copy_file, longest_matching_root
-from utils.image_utils import quantize_to_palette
 
 ProgressCallback = Callable[[str], None]
 
@@ -146,46 +143,56 @@ def _output_name(original: str, suffix: str) -> str:
     return str(path.with_name(f"{path.stem}{suffix}{path.suffix}"))
 
 
-def _wants_palette(source_mode: str, png_format: str) -> bool:
-    """
-    決定輸出要不要存成 8-bit 調色盤。
-
-    這是檔案大小的主要決定因素：已被 pngquant / TinyPNG 量化過的素材是
-    調色盤 PNG（每像素 1 byte），存回 32-bit RGBA（每像素 4 byte）的話，
-    就算尺寸砍半、像素數只剩 1/4，檔案也只是打平甚至變大。
-    """
-    if png_format == PNG_FORMAT_PALETTE:
-        return True
-    if png_format == PNG_FORMAT_RGBA:
-        return False
-    return source_mode in ("P", "PA")  # PNG_FORMAT_MATCH：跟隨來源
+# 壓縮引擎無內部狀態，共用一個實例即可
+_COMPRESSOR = Compressor()
 
 
-def _save_image(
+def compress_texture(
     image: Image.Image,
-    path: Path,
-    source_mode: str = "RGBA",
-    png_format: str = PNG_FORMAT_MATCH,
-    dithering: float = 0.0,
+    suffix: str,
+    compression: CompressionOptions,
+    fast: bool = False,
+) -> tuple[Image.Image, bytes, str]:
+    """
+    以 JR-Img-Compresser 的壓縮引擎編碼貼圖。
+
+    Returns:
+        (壓縮後的預覽影像, 檔案 bytes, 編碼描述)
+    """
+    fmt = format_for_suffix(suffix)
+    preview, data = _COMPRESSOR.compress(image, compression, fmt, fast=fast)
+    return preview, data, describe_encoding(compression, fmt)
+
+
+def _save_texture(
+    image: Image.Image,
+    dst_path: Path,
+    src_path: Path,
+    scale: float,
+    compression: CompressionOptions,
 ) -> str:
-    """寫出貼圖，回傳實際使用的編碼描述（供報告顯示）。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = path.suffix.lower()
+    """
+    壓縮並寫出貼圖，回傳編碼描述。
 
-    if suffix in (".jpg", ".jpeg"):
-        image.convert("RGB").save(path, quality=95, optimize=True)
-        return "JPEG"
-    if suffix == ".webp":
-        image.save(path, lossless=True)
-        return "WebP 無損"
+    絕不變大保護（同 TinyPNG / JR-Img-Compresser 行為）：
+    比例 100% 且未做有損/色彩格式量化時，輸出像素與原圖等值——
+    若壓縮結果反而比原檔大，直接沿用原檔 bytes。
+    """
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    _, data, encoding = compress_texture(image, dst_path.suffix, compression)
 
-    if _wants_palette(source_mode, png_format):
-        quantized, engine = quantize_to_palette(image, PALETTE_COLORS, dithering)
-        quantized.save(path, optimize=True)
-        return f"8-bit 調色盤（{engine}）"
+    if scale == 1.0 and not compression.alters_pixels:
+        try:
+            src_bytes = src_path.stat().st_size
+        except OSError:
+            src_bytes = 0
+        if src_bytes and len(data) >= src_bytes:
+            if src_path.resolve() != dst_path.resolve():
+                copy_file(src_path, dst_path)
+            return "沿用原檔（壓縮無收益）"
 
-    image.save(path, optimize=True)
-    return "32-bit RGBA"
+    dst_path.write_bytes(data)
+    return encoding
 
 
 # ---------------------------------------------------------------- 主流程
@@ -354,12 +361,12 @@ def _process_page(
                 report.add(LEVEL_INFO, f"[{page.name}] {note}")
             if in_place:
                 backup_once(dst_path)
-            encoding = _save_image(
+            encoding = _save_texture(
                 render.image,
                 dst_path,
-                source_mode=source_mode,
-                png_format=options.png_format,
-                dithering=options.dithering,
+                src_path,
+                scale,
+                options.compression,
             )
             rendered_pages[dst_path.resolve()] = (src_path.resolve(), fingerprint)
             reused = False

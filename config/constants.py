@@ -52,18 +52,27 @@ PAGE_ALIGN_NONE = 1
 PAGE_ALIGN_4 = 4
 PAGE_ALIGN_POT = -1  # 補到 2 的次方（只補畫布、不改縮放比例）
 
-# 貼圖輸出的色彩編碼。
-#
-# 這件事對檔案大小的影響比縮放本身還大：已經被 pngquant / TinyPNG 量化過的
-# 素材是 8-bit 調色盤（每像素 1 byte），若讀進來後存成 32-bit RGBA（每像素
-# 4 byte），就算尺寸砍半、像素數只剩 1/4，檔案大小也只是打平甚至變大。
-PNG_FORMAT_MATCH = "match"      # 跟隨來源：來源是調色盤就輸出調色盤
-PNG_FORMAT_RGBA = "rgba"        # 一律 32-bit RGBA（最高品質）
-PNG_FORMAT_PALETTE = "palette"  # 一律 8-bit 調色盤（最小檔案）
-DEFAULT_PNG_FORMAT = PNG_FORMAT_MATCH
+# ---------------------------------------------------------------- 壓縮設定（與 JR-Img-Compresser 一致）
 
-PALETTE_COLORS = 256
-DEFAULT_DITHERING = 0.0
+# 顯示名稱對應（設定面板下拉選單用；資料值為 models.compression_options 的 Enum value）
+PNG_MODES = {
+    "lossless": "無損（零品質損失）",
+    "lossy": "智慧有損（類 TinyPNG，最小）",
+}
+PNG_COLOR_FORMATS = {
+    "rgba8888": "RGBA8888（原始 32-bit）",
+    "rgba5551": "RGBA5551（1-bit 鏤空透明）",
+    "rgba4444": "RGBA4444（引擎常用，最小）",
+    "rgb565": "RGB565（不透明，最小）",
+}
+COMPRESSION_EFFORTS = {
+    "fast": "快速",
+    "standard": "標準",
+    "max": "極限（較慢）",
+}
+DEFAULT_PNG_QUALITY = 80
+MIN_TARGET_SIZE_KB = 5
+MAX_TARGET_SIZE_KB = 51200
 
 OUTPUT_SUBFOLDER = "subfolder"
 OUTPUT_CUSTOM = "custom"

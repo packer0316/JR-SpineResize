@@ -1,6 +1,7 @@
 """使用者設定的儲存與讀取（記住上次的處理選項）"""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from PyQt6.QtCore import QSettings
@@ -10,7 +11,6 @@ from config.constants import (
     APP_NAME,
     BLEED_RGB,
     DEFAULT_BLEED_PX,
-    DEFAULT_PNG_FORMAT,
     DEFAULT_RESAMPLE,
     DEFAULT_SCALE_PERCENT,
     DEFAULT_SUBFOLDER_NAME,
@@ -19,6 +19,7 @@ from config.constants import (
     OUTPUT_SUBFOLDER,
     PAGE_ALIGN_NONE,
 )
+from models.compression_options import CompressionOptions
 from models.process_options import ProcessOptions
 
 
@@ -30,15 +31,26 @@ def load_options() -> ProcessOptions:
     s = _settings()
     output_dir = s.value("output/dir", "", type=str)
     prescaled = s.value("scale/prescaled_dir", "", type=str)
+
+    # 壓縮設定整包存成 JSON（欄位多且會隨版本演進，逐鍵存取太脆弱）
+    compression = CompressionOptions()
+    raw = s.value("compression/json", "", type=str)
+    if raw:
+        try:
+            compression = CompressionOptions.from_dict(json.loads(raw))
+        except (ValueError, TypeError):
+            pass
+
     return ProcessOptions(
         mode=s.value("mode", MODE_RESCALE, type=str),
+        resize_enabled=s.value("scale/enabled", True, type=bool),
         scale_percent=s.value("scale/percent", DEFAULT_SCALE_PERCENT, type=float),
         resample=s.value("scale/resample", DEFAULT_RESAMPLE, type=str),
         alpha_mode=s.value("scale/alpha_mode", ALPHA_MODE_PREMULTIPLY, type=str),
         bleed=s.value("scale/bleed", BLEED_RGB, type=str),
         bleed_px=s.value("scale/bleed_px", DEFAULT_BLEED_PX, type=int),
         page_align=s.value("scale/page_align", PAGE_ALIGN_NONE, type=int),
-        png_format=s.value("scale/png_format", DEFAULT_PNG_FORMAT, type=str),
+        compression=compression,
         prescaled_dir=Path(prescaled) if prescaled else None,
         derive_scale_from_image=s.value("scale/derive_from_image", True, type=bool),
         output_mode=s.value("output/mode", OUTPUT_SUBFOLDER, type=str),
@@ -52,13 +64,14 @@ def load_options() -> ProcessOptions:
 def save_options(options: ProcessOptions) -> None:
     s = _settings()
     s.setValue("mode", options.mode)
+    s.setValue("scale/enabled", options.resize_enabled)
     s.setValue("scale/percent", options.scale_percent)
     s.setValue("scale/resample", options.resample)
     s.setValue("scale/alpha_mode", options.alpha_mode)
     s.setValue("scale/bleed", options.bleed)
     s.setValue("scale/bleed_px", options.bleed_px)
     s.setValue("scale/page_align", options.page_align)
-    s.setValue("scale/png_format", options.png_format)
+    s.setValue("compression/json", json.dumps(options.compression.to_dict(), ensure_ascii=False))
     s.setValue("scale/prescaled_dir", str(options.prescaled_dir) if options.prescaled_dir else "")
     s.setValue("scale/derive_from_image", options.derive_scale_from_image)
     s.setValue("output/mode", options.output_mode)

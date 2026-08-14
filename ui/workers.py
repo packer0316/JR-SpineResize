@@ -6,16 +6,15 @@ from pathlib import Path
 from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from config.constants import MODE_RESCALE, PNG_FORMAT_PALETTE
+from config.constants import MODE_RESCALE
 from core.atlas_parser import parse_atlas_file
 from core.page_renderer import RenderSettings, render_page
-from core.pipeline import BatchResult, process_asset
+from core.pipeline import BatchResult, compress_texture, process_asset
 from core.project_scanner import scan_projects
 from core.rect_mapper import align_up, apply_page_mapping, build_page_mapping, round_half_up
 from core.spine.texture_store import AtlasTextureStore
 from models.process_options import ProcessOptions
 from models.spine_project import STATUS_DONE, STATUS_FAILED, SpineProject
-from utils.image_utils import quantize_to_palette
 
 
 class ScanWorker(QThread):
@@ -86,13 +85,15 @@ class ProcessWorker(QThread):
 
 class PreviewWorker(QThread):
     """
-    依套用的設定在記憶體中產生「縮放後」貼圖庫，供播放器切換對比。
+    依套用的設定在記憶體中產生「縮放後」貼圖庫，供播放器切換對比，
+    並順便以壓縮引擎（快速模式）估算每張貼圖處理後的檔案大小。
 
     走與正式處理完全相同的路徑（build_page_mapping / render_page /
-    apply_page_mapping），所以預覽畫面就是輸出結果。
+    compress_texture / apply_page_mapping），所以預覽畫面就是輸出結果。
     """
 
     built = pyqtSignal(object, object, str)   # project, AtlasTextureStore, label
+    estimated = pyqtSignal(object, object)    # project, 估算結果 dict
     failed = pyqtSignal(object, str)          # project, error
 
     def __init__(self, project: SpineProject, options: ProcessOptions, parent=None) -> None:
@@ -103,15 +104,14 @@ class PreviewWorker(QThread):
     def run(self) -> None:
         project = self._project
         options = self._options
-        asset = project.primary_atlas
-        if asset is None or not asset.is_loadable:
+        primary = project.primary_atlas
+        if primary is None or not primary.is_loadable:
             self.failed.emit(project, "沒有可用的 atlas")
             return
         if options.mode != MODE_RESCALE:
             self.failed.emit(project, "「只重算 atlas」模式不提供縮放預覽")
             return
         try:
-            atlas = parse_atlas_file(asset.atlas_path)
             settings = RenderSettings(
                 resample=options.resample,
                 alpha_mode=options.alpha_mode,
@@ -119,37 +119,72 @@ class PreviewWorker(QThread):
                 bleed_px=options.bleed_px,
             )
             scale = options.scale
-            pages: dict[str, Image.Image] = {}
-            for page in atlas.pages:
-                src_path = asset.pages.get(page.name)
-                if src_path is None:
-                    continue
-                with Image.open(src_path) as source_img:
-                    source_mode = source_img.mode
-                    source = source_img.convert("RGBA")
-                declared = page.size
-                if source.size != declared:
-                    self.failed.emit(
-                        project,
-                        f"{page.name} 實際尺寸與 atlas 宣告不符，可能已被縮放過",
-                    )
-                    return
-                canvas = (
-                    max(1, align_up(round_half_up(declared[0] * scale), options.page_align)),
-                    max(1, align_up(round_half_up(declared[1] * scale), options.page_align)),
-                )
-                mapping = build_page_mapping(page, scale, scale, canvas)
-                rendered = render_page(source, mapping, settings).image
-                # 若輸出會量化成調色盤，預覽也量化，讓對比忠實
-                wants_palette = options.png_format == PNG_FORMAT_PALETTE or (
-                    options.png_format != "rgba" and source_mode in ("P", "PA")
-                )
-                if wants_palette:
-                    rendered = quantize_to_palette(rendered, dithering=options.dithering)[0].convert("RGBA")
-                apply_page_mapping(mapping)
-                pages[page.name] = rendered
+            store = None
+            page_estimates: list[dict] = []
+            seen_paths: set = set()
 
-            store = AtlasTextureStore(atlas, pages)
-            self.built.emit(project, store, f"{options.scale_percent:g}%")
+            for asset in project.atlases:
+                if not asset.is_loadable or asset.missing_pages:
+                    continue
+                atlas = parse_atlas_file(asset.atlas_path)
+                pages: dict[str, Image.Image] = {}
+                for page in atlas.pages:
+                    src_path = asset.pages.get(page.name)
+                    if src_path is None:
+                        continue
+                    with Image.open(src_path) as source_img:
+                        source = source_img.convert("RGBA")
+                    declared = page.size
+                    if source.size != declared:
+                        self.failed.emit(
+                            project,
+                            f"{page.name} 實際尺寸與 atlas 宣告不符，可能已被縮放過",
+                        )
+                        return
+                    canvas = (
+                        max(1, align_up(round_half_up(declared[0] * scale), options.page_align)),
+                        max(1, align_up(round_half_up(declared[1] * scale), options.page_align)),
+                    )
+                    mapping = build_page_mapping(page, scale, scale, canvas)
+                    rendered = render_page(source, mapping, settings).image
+                    # 與正式輸出同一顆壓縮引擎（快速模式）：
+                    # 預覽影像即壓縮後畫面，bytes 長度即預估檔案大小
+                    preview_img, data, _ = compress_texture(
+                        rendered, src_path.suffix, options.compression, fast=True
+                    )
+                    apply_page_mapping(mapping)
+                    if asset is primary:
+                        pages[page.name] = preview_img.convert("RGBA")
+
+                    key = src_path.resolve()
+                    if key in seen_paths:
+                        continue  # 多份 atlas 共用同一張貼圖，只計一次
+                    seen_paths.add(key)
+                    src_bytes = src_path.stat().st_size if src_path.exists() else 0
+                    est_bytes = len(data)
+                    # 與 pipeline 的「絕不變大保護」一致：無縮放且無量化時不會輸出更大的檔案
+                    if scale == 1.0 and not options.compression.alters_pixels and src_bytes:
+                        est_bytes = min(est_bytes, src_bytes)
+                    page_estimates.append({
+                        "name": src_path.name,
+                        "src_bytes": src_bytes,
+                        "est_bytes": est_bytes,
+                        "src_size": declared,
+                        "dst_size": canvas,
+                    })
+
+                if asset is primary:
+                    store = AtlasTextureStore(atlas, pages)
+
+            label = f"{options.scale_percent:g}%" if options.resize_enabled else "壓縮後"
+            if store is not None:
+                self.built.emit(project, store, label)
+            estimate = {
+                "fingerprint": options.render_fingerprint(),
+                "pages": page_estimates,
+                "src_total": sum(p["src_bytes"] for p in page_estimates),
+                "est_total": sum(p["est_bytes"] for p in page_estimates),
+            }
+            self.estimated.emit(project, estimate)
         except Exception as exc:  # noqa: BLE001 - 預覽失敗回報即可
             self.failed.emit(project, str(exc))

@@ -126,11 +126,21 @@ class MainWindow(QMainWindow):
         for text, slot in (
             ("加入資料夾", self._add_folder),
             ("加入檔案", self._add_files),
-            ("清空", self._clear),
         ):
             button = QPushButton(text)
             button.clicked.connect(slot)
             row.addWidget(button)
+
+        self.remove_button = QPushButton("移除選取")
+        self.remove_button.setToolTip("把選取的專案從清單移除（不會刪除本地檔案）")
+        self.remove_button.setEnabled(False)
+        self.remove_button.clicked.connect(self._remove_selected)
+        row.addWidget(self.remove_button)
+
+        clear_button = QPushButton("清空")
+        clear_button.setToolTip("清空整個清單（不會刪除本地檔案）")
+        clear_button.clicked.connect(self._clear)
+        row.addWidget(clear_button)
         row.addStretch(1)
         return row
 
@@ -146,8 +156,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.settings_panel, 1)
 
         apply_row = QHBoxLayout()
-        self.apply_button = QPushButton("套用到此專案")
+        self.apply_button = QPushButton("套用到此專案 (T)")
         self.apply_button.setProperty("role", "primary")
+        self.apply_button.setToolTip("套用目前設定到選取的專案（快捷鍵：T）")
         self.apply_button.clicked.connect(self._apply_current)
         apply_row.addWidget(self.apply_button, 1)
 
@@ -155,7 +166,8 @@ class MainWindow(QMainWindow):
         self.apply_all_button.clicked.connect(self._apply_all)
         apply_row.addWidget(self.apply_all_button)
 
-        self.unapply_button = QPushButton("取消套用")
+        self.unapply_button = QPushButton("取消套用 (R)")
+        self.unapply_button.setToolTip("取消選取專案的套用（快捷鍵：R）")
         self.unapply_button.clicked.connect(self._unapply_current)
         apply_row.addWidget(self.unapply_button)
         layout.addLayout(apply_row)
@@ -265,6 +277,7 @@ class MainWindow(QMainWindow):
 
     def _on_project_selected(self, project: SpineProject | None) -> None:
         self.detail.show_project(project)
+        self.remove_button.setEnabled(project is not None)
         if project is None:
             return
         if project.applied_options is not None:
@@ -379,6 +392,15 @@ class MainWindow(QMainWindow):
         if self.project_list.current_project() is project:
             self.detail.apply_estimate(project)
 
+    def _remove_selected(self) -> None:
+        """把選取的專案移出清單——只是不再編輯它，本地檔案完全不動"""
+        project = self.project_list.current_project()
+        if project is None:
+            return
+        self._preview_cache.pop(id(project), None)
+        if self.project_list.remove_project(project):
+            self._update_footer()
+
     def _unapply_current(self) -> None:
         project = self.project_list.current_project()
         if project is None:
@@ -473,6 +495,25 @@ class MainWindow(QMainWindow):
         self.project_list.refresh_all()
         self._update_footer()
         ReportDialog(batch, skipped, self).exec()
+
+    # ------------------------------------------------------------ 快捷鍵
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        """
+        T = 套用到此專案、R = 取消套用。
+
+        刻意用 keyPressEvent 而不是 QShortcut：按鍵會先給焦點所在的控制項，
+        所以在檔名後綴等輸入框裡打 t / r 仍然是打字，不會誤觸按鈕。
+        """
+        if event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            button = {
+                Qt.Key.Key_T: self.apply_button,
+                Qt.Key.Key_R: self.unapply_button,
+            }.get(event.key())
+            if button is not None and button.isEnabled():
+                button.animateClick()
+                return
+        super().keyPressEvent(event)
 
     # ------------------------------------------------------------ 關閉
 

@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QAbstractSlider,
+    QAbstractSpinBox,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -112,8 +114,42 @@ class SettingsPanel(QScrollArea):
         layout.addStretch(1)
 
         self.setWidget(container)
+        self._install_wheel_guard(container)
         self._connect_signals()
         self._sync_enabled()
+
+    # ------------------------------------------------------------ 滾輪防誤觸
+
+    def _install_wheel_guard(self, root: QWidget) -> None:
+        """
+        滾輪一律用來滾動面板。
+
+        下拉選單與數值控制項預設會吃掉滾輪事件去改值，滑過去就被改掉，
+        很容易在瀏覽設定時誤觸。
+        """
+        for widget in root.findChildren(QWidget):
+            if isinstance(widget, (QComboBox, QAbstractSpinBox, QAbstractSlider)):
+                widget.installEventFilter(self)
+                # 只有點過（取得焦點）才吃鍵盤，避免滑過去就被方向鍵改到
+                widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.Wheel and isinstance(
+            obj, (QComboBox, QAbstractSpinBox, QAbstractSlider)
+        ):
+            # 直接捲動面板。不能把同一個事件物件再 sendEvent 出去——
+            # 事件仍在派送中，重新派送會在 Qt 內部炸掉。
+            self._scroll_by_wheel(event.angleDelta().y())
+            return True
+        return super().eventFilter(obj, event)
+
+    def _scroll_by_wheel(self, angle_delta: int) -> None:
+        """一格滾輪（120）捲三行，與 Qt 預設的捲動量一致"""
+        if not angle_delta:
+            return
+        bar = self.verticalScrollBar()
+        pixels = (angle_delta / 120.0) * max(bar.singleStep(), 20) * 3
+        bar.setValue(bar.value() - round(pixels))
 
     # ------------------------------------------------------------ 卡片建構輔助
 
@@ -473,6 +509,13 @@ class SettingsPanel(QScrollArea):
         layout.addWidget(
             _hint("骨架檔只會被原樣複製，內容絕不修改——等比縮貼圖時骨架本來就不該改動。")
         )
+
+        self.export_log_check = QCheckBox("匯出處理紀錄（log）")
+        self.export_log_check.setToolTip(
+            "在輸出資料夾產生一份文字紀錄，逐筆記下每張貼圖的\n"
+            "檔名、來源與輸出的絕對路徑、尺寸與容量各縮小了幾 %"
+        )
+        layout.addWidget(self.export_log_check)
         return card
 
     def _browse_output(self) -> None:
@@ -510,6 +553,7 @@ class SettingsPanel(QScrollArea):
             self.resize_enabled_check,
             self.derive_check,
             self.copy_skeleton_check,
+            self.export_log_check,
         ):
             check.toggled.connect(self._on_changed)
         for slider in (self.png_quality_slider, self.png_dither_slider):
@@ -603,6 +647,7 @@ class SettingsPanel(QScrollArea):
             subfolder_name=self.subfolder_edit.text().strip() or "resized",
             filename_suffix=self.suffix_edit.text().strip(),
             copy_skeleton=self.copy_skeleton_check.isChecked(),
+            export_log=self.export_log_check.isChecked(),
         )
 
     def set_options(self, options: ProcessOptions) -> None:
@@ -638,6 +683,7 @@ class SettingsPanel(QScrollArea):
             self.subfolder_edit.setText(options.subfolder_name)
             self.suffix_edit.setText(options.filename_suffix)
             self.copy_skeleton_check.setChecked(options.copy_skeleton)
+            self.export_log_check.setChecked(options.export_log)
         finally:
             for widget, blocked in zip(self._all_inputs(), blockers):
                 widget.blockSignals(blocked)
@@ -673,6 +719,7 @@ class SettingsPanel(QScrollArea):
             self.subfolder_edit,
             self.suffix_edit,
             self.copy_skeleton_check,
+            self.export_log_check,
         ]
 
     @staticmethod

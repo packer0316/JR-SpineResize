@@ -99,12 +99,27 @@ class ProjectList(QTableWidget):
         )
         return item
 
+    def _row_of(self, project: SpineProject) -> int | None:
+        """以身分（不是相等）比對——不同專案的欄位值可能完全相同"""
+        return next((i for i, p in enumerate(self._projects) if p is project), None)
+
     def refresh_project(self, project: SpineProject) -> None:
-        try:
-            row = self._projects.index(project)
-        except ValueError:
-            return
-        self._fill_row(row, project)
+        row = self._row_of(project)
+        if row is not None:
+            self._fill_row(row, project)
+
+    def remove_project(self, project: SpineProject) -> bool:
+        """從清單移除（只移出編輯器，不動本地檔案）"""
+        row = self._row_of(project)
+        if row is None:
+            return False
+        self._projects.pop(row)
+        self.removeRow(row)
+        if self._projects:
+            self.selectRow(min(row, len(self._projects) - 1))
+        else:
+            self.selection_changed.emit(None)
+        return True
 
     def refresh_all(self) -> None:
         for row, project in enumerate(self._projects):

@@ -52,6 +52,8 @@ class ProcessOptions:
     subfolder_name: str = DEFAULT_SUBFOLDER_NAME
     filename_suffix: str = ""
     copy_skeleton: bool = True
+    # 匯出處理紀錄：每張貼圖的檔名、絕對路徑、尺寸與容量變化
+    export_log: bool = False
     # 使用者拖入的來源根目錄，用於在自訂輸出時保留相對路徑結構
     source_roots: list[Path] = field(default_factory=list)
 

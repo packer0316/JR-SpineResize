@@ -98,6 +98,9 @@ class AssetResult:
 @dataclass
 class BatchResult:
     results: list[AssetResult] = field(default_factory=list)
+    # 啟用「匯出處理紀錄」時實際寫出的 log 路徑，以及寫出失敗的原因
+    log_path: Path | None = None
+    log_error: str = ""
 
     @property
     def succeeded(self) -> list[AssetResult]:

@@ -1,0 +1,3 @@
+# Windows 批次檔必須是 CRLF：cmd 對 LF-only 檔案的 ^ 續行會直接壞掉，
+# build.bat 曾因此整段 PyInstaller 命令被拆碎、打包失敗
+*.bat text eol=crlf

@@ -15,7 +15,6 @@
 7. 只點開來看不算「自訂」——沒動過就不會被套用
 8. 「還原原始版面」真的回到原檔：atlas byte-identical、貼圖像素不變
 9. 點一下選取**不會**把元件固定；改比例會**取消固定**並排到最小
-   （「還原原始版面」會固定整張的元件，之後全選改比例必須能縮下去）
 10. 拖曳「進行中」右側的尺寸就要跟著更新，不是放開才跳一次
 11. 100% 時排版**永不變大**：初始就是原始版面（面積 0% 變化），
     按「重新排版」或從其他比例調回 100% 也不會比原檔大——
@@ -28,6 +27,8 @@
     都能一步一步退回（每張合圖各自的歷史）
 15. 覆蓋輸出後記憶體要跟上磁碟：atlas 資料重新解析、已消耗的版面移除，
     處理完回編輯器不再拿舊座標裁新貼圖（跑版）；同步前開編輯器要警告
+16. 「還原原始版面」不固定元件——還原後再調整任何散圖，自動重排要能
+    把版面縮下去（以前全被固定，調了也縮不動，像自動重排壞掉）
 
 第 1 ~ 3 點是為了鎖住一個修過的 bug：縮放比例原本以「當下的選取範圍」為基準，
 元件變大會讓基準跟著變大 → 比例變小 → 元件縮回去，滑鼠沒動也會在兩個尺寸
@@ -641,6 +642,30 @@ def main() -> int:
             viewer4.close()
         finally:
             shutil.rmtree(work4, ignore_errors=True)
+
+        print("\n[16] 還原原始版面後再調整，自動重排要生效")
+        rv = SheetEditorDialog(groups=groups, layouts=LayoutStore(), default_scale=1.0)
+        rv.resize(1100, 700)
+        rv.show()
+        app.processEvents()
+        rv._revert_selected()
+        app.processEvents()
+        r_layout = rv.canvas.layout
+        check(
+            r_layout.is_identity and not any(p.pinned for p in r_layout.placements),
+            "還原後為恆等版面且元件不被固定",
+        )
+        rv.canvas.select([r_layout.placements[0]])
+        rv.item_spin.setValue(40.0)   # 只調一個散圖，其餘要跟著重排縮下去
+        app.processEvents()
+        area = r_layout.canvas[0] * r_layout.canvas[1]
+        src_area = r_layout.src_canvas[0] * r_layout.src_canvas[1]
+        check(
+            r_layout.is_packed and area < src_area,
+            f"調整單一散圖後自動重排 -> {r_layout.canvas}"
+            f"（面積 {area / src_area * 100:.0f}%）",
+        )
+        rv.close()
 
         print("\n全部通過" if not failed else f"\n失敗 {failed} 項")
         return 1 if failed else 0

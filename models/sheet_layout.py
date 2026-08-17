@@ -199,12 +199,15 @@ class SheetLayout:
         """
         還原成原始版面：比例 1.0、位置與畫布都回到來源 atlas 的樣子。
 
-        每個元件都標成 pinned，之後若使用者又按「重新排版」才會被移動。
+        刻意**不**固定元件：沒有任何操作會自動重排，恆等版面自然保持原樣；
+        使用者一旦再調整（改比例、重排），就照一般規則整張重新排版。
+        以前這裡把全部元件標成 pinned，結果還原後再調整任何一個元件，
+        其餘元件全被固定住，版面永遠縮不下去（看起來像自動重排壞掉）。
         """
         for placement in self.placements:
             placement.set_scale(1.0)
             placement.pos = (placement.src_rect[0], placement.src_rect[1])
-            placement.pinned = True
+            placement.pinned = False
         self.canvas = self.src_canvas
 
     def by_rect(self) -> dict[Rect, Placement]:
@@ -305,6 +308,12 @@ class SheetLayout:
             placement = Placement.from_dict(raw)
             if placement is not None:
                 layout.placements.append(placement)
+        if layout.is_identity:
+            # 舊版「還原原始版面」會把恆等版面的元件全部固定；恆等版面
+            # 不靠固定維持（沒編輯就不會重排），載入時把固定拿掉，
+            # 否則舊專案檔還原出來的版面一調整就全被固定卡死、縮不下去
+            for placement in layout.placements:
+                placement.pinned = False
         return layout if layout.placements else None
 
 

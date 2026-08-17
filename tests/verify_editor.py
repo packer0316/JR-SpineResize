@@ -10,11 +10,12 @@
 2. 沿同一個方向拖，大小單調變化（不會忽大忽小）
 3. 拖遠再拖回同一點，回到完全一樣的大小
 4. 任何時候都保持等比（同一元件的 x/y 比例一致，否則 Spine 頂點會跑掉）
-5. 多選一起拖時每個元件都同步等比
+5. 多選一起拖時每個元件都同步等比，而且**不會**被固定
 6. 排版後沒有元件重疊
 7. 只點開來看不算「自訂」——沒動過就不會被套用
 8. 「還原原始版面」真的回到原檔：atlas byte-identical、貼圖像素不變
-9. 點一下選取**不會**把元件固定；「取消全部固定並重排」會排到最小
+9. 點一下選取**不會**把元件固定；改比例會**取消固定**並排到最小
+   （「還原原始版面」會固定整張的元件，之後全選改比例必須能縮下去）
 10. 拖曳「進行中」右側的尺寸就要跟著更新，不是放開才跳一次
 11. 100% 時排版**永不變大**：初始就是原始版面（面積 0% 變化），
     按「重新排版」或從其他比例調回 100% 也不會比原檔大——
@@ -23,6 +24,8 @@
     其他控制項停用、畫布唯讀
 13. 專案檔 round-trip：編輯器做得出來的每一種版面（混合比例、固定位置、
     自訂間距、還原的恆等版面）與套用的設定，存檔重開後逐欄位相同
+14. Ctrl+Z 復原／Ctrl+Y 重做：比例、位置、固定狀態、還原原始版面
+    都能一步一步退回（每張合圖各自的歷史）
 
 第 1 ~ 3 點是為了鎖住一個修過的 bug：縮放比例原本以「當下的選取範圍」為基準，
 元件變大會讓基準跟著變大 → 比例變小 → 元件縮回去，滑鼠沒動也會在兩個尺寸
@@ -223,10 +226,10 @@ def main() -> int:
         )
         same = len({round(p.scale, 4) for p in picked}) == 1
         check(stable and same, f"{series[0]} → {series[-1]}，比例一致 {same}")
+        check(sum(1 for p in picked if p.pinned) == 0, "角落縮放不會把元件固定")
 
         print("\n[6] 排版後沒有元件重疊")
         dialog.auto_check.setChecked(True)
-        dialog._unpin_all()                 # 之前拖過的元件會被固定，先解掉
         canvas.select_all()
         dialog.item_spin.setValue(50.0)     # 全選 + 比例 = 整組縮放
         app.processEvents()
@@ -295,7 +298,7 @@ def main() -> int:
         same_px = px_after.shape == px_before.shape and np.array_equal(px_after, px_before)
         check(same_px, f"貼圖像素完全相同（{px_before.shape[1]}x{px_before.shape[0]}）")
 
-        print("\n[9] 點選不會固定元件；取消全部固定並重排會排到最小")
+        print("\n[9] 點選不會固定元件；改比例會取消固定並排到最小")
         pins = SheetEditorDialog(groups=groups, layouts=LayoutStore(), default_scale=1.0)
         pins.resize(1100, 700)
         pins.show()
@@ -325,17 +328,17 @@ def main() -> int:
         app.processEvents()
         check(moved.pinned, "真的拖曳後才被固定")
 
-        # 全選改比例後按「取消全部固定並重排」：固定要被取消，畫布縮到接近理論最小
+        # 全選改比例：固定要被自動取消（位置是在舊比例下挑的），
+        # 畫布才縮得到接近理論最小——「還原原始版面」後整張都被固定，
+        # 沒有這條規則的話重排就永遠縮不下去
         pin_canvas.select_all()
         pins.item_spin.setValue(17.0)
-        app.processEvents()
-        pins._unpin_all()
         app.processEvents()
         small = pin_canvas.layout
         pinned_after = sum(1 for p in small.placements if p.pinned)
         fill = small.used_area / (small.canvas[0] * small.canvas[1]) * 100
         check(pinned_after == 0 and fill >= 55,
-              f"17% + 取消固定並重排 -> {small.canvas}、填充 {fill:.0f}%、固定 {pinned_after} 個")
+              f"全選改 17% -> {small.canvas}、填充 {fill:.0f}%、固定 {pinned_after} 個")
         pins.close()
 
         print("\n[10] 拖曳中右側讀數就要跟著動")
@@ -520,6 +523,58 @@ def main() -> int:
             )
         finally:
             shutil.rmtree(work3, ignore_errors=True)
+
+        print("\n[14] Ctrl+Z 復原／Ctrl+Y 重做")
+        undo_dlg = SheetEditorDialog(groups=groups, layouts=LayoutStore(), default_scale=1.0)
+        undo_dlg.resize(1100, 700)
+        undo_dlg.show()
+        app.processEvents()
+        u_layout = undo_dlg.canvas.layout
+        first = u_layout.placements[0]
+        scale_before = first.scale
+        canvas_before = u_layout.canvas
+
+        undo_dlg.canvas.select([first])
+        undo_dlg.item_spin.setValue(37.0)
+        app.processEvents()
+        check(abs(first.scale - 0.37) < 1e-6, f"改比例 -> {first.scale * 100:.0f}%")
+        undo_dlg._undo()
+        app.processEvents()
+        check(
+            abs(first.scale - scale_before) < 1e-6 and u_layout.canvas == canvas_before,
+            f"Ctrl+Z 還原比例與畫布 -> {u_layout.canvas}",
+        )
+        undo_dlg._redo()
+        app.processEvents()
+        check(abs(first.scale - 0.37) < 1e-6, "Ctrl+Y 重做")
+        undo_dlg._undo()
+        app.processEvents()
+
+        second = u_layout.placements[1]
+        pos_before = second.pos
+        undo_dlg.canvas.select([second])
+        undo_dlg.canvas.nudge(5, 3)
+        app.processEvents()
+        check(second.pos != pos_before and second.pinned, "微調後位置改變且被固定")
+        undo_dlg._undo()
+        app.processEvents()
+        check(second.pos == pos_before and not second.pinned,
+              "Ctrl+Z 連位置與固定狀態一起還原")
+
+        undo_dlg.canvas.select_all()
+        undo_dlg.item_spin.setValue(50.0)
+        app.processEvents()
+        canvas_small = u_layout.canvas
+        undo_dlg._revert_selected()
+        app.processEvents()
+        check(u_layout.is_identity, "還原原始版面 -> 恆等版面")
+        undo_dlg._undo()
+        app.processEvents()
+        check(
+            u_layout.canvas == canvas_small and not u_layout.is_identity,
+            f"「還原原始版面」也能 Ctrl+Z 退回 -> {u_layout.canvas}",
+        )
+        undo_dlg.close()
 
         print("\n全部通過" if not failed else f"\n失敗 {failed} 項")
         return 1 if failed else 0

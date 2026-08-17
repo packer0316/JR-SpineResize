@@ -5,7 +5,7 @@
 
 * 點一下選取，Ctrl 加選，在空白處拉框多選
 * 拖曳角落控制點 = 等比縮放（只能等比：同一個區塊的 x/y 比例必須一致，
-  拉成長方形會讓 Spine 算出來的頂點跑掉）
+  拉成長方形會讓 Spine 算出來的頂點跑掉）；改了比例會取消該元件的固定
 * 拖曳元件本體 = 搬移，搬過的元件會被「固定」，自動排版時不再被移動
 * 方向鍵微調位置、Shift + 方向鍵一次 10px
 * 滾輪縮放檢視、中鍵或空白鍵拖曳平移
@@ -65,6 +65,9 @@ class SheetCanvas(QWidget):
     # 拖曳「進行中」每一步都會發：右側的尺寸要邊拖邊更新，不能等放開才跳一次。
     # 只用來刷新讀數，不觸發重新排版，所以拖再快也不會卡。
     editing = pyqtSignal()
+    # 一次拖曳（搬移／縮放）或微調「真的要改到版面」的那一刻發出，
+    # 且在第一筆修改之前——上層在這裡拍快照，Ctrl+Z 才回得到拖曳前的狀態
+    edit_started = pyqtSignal()
     zoom_changed = pyqtSignal(float)
 
     def __init__(self, parent=None) -> None:
@@ -331,6 +334,8 @@ class SheetCanvas(QWidget):
 
         delta = event.position().toPoint() - drag.origin
         if abs(delta.x()) > 1 or abs(delta.y()) > 1:
+            if not drag.moved and drag.mode in ("move", "resize"):
+                self.edit_started.emit()   # 第一筆修改之前，讓上層拍復原快照
             drag.moved = True
 
         if drag.mode == "pan" and drag.start_offset is not None:
@@ -447,14 +452,17 @@ class SheetCanvas(QWidget):
             if base is None:
                 continue
             placement.set_scale(base * ratio)
-            # 多選時各自以錨點為基準等比移動，整組看起來就像一起縮放
+            # 改了比例就取消固定：固定的位置是在舊比例下挑的，留著只會讓
+            # 重排縮不下去（71 個全固定的版面就是這樣卡死的）
+            placement.pinned = False
+            # 多選時各自以錨點為基準等比移動，整組看起來就像一起縮放；
+            # 放開後自動重排會重新決定位置
             start = (drag.start_positions or {}).get(id(placement))
             if start is not None and len(self._selected) > 1:
                 placement.pos = (
                     max(0, anchor_x + round((start[0] - anchor_x) * ratio)),
                     max(0, anchor_y + round((start[1] - anchor_y) * ratio)),
                 )
-                placement.pinned = True
         self.editing.emit()
         self.update()
 
@@ -462,6 +470,7 @@ class SheetCanvas(QWidget):
         """方向鍵微調（會把元件固定住）"""
         if self._layout is None or not self._selected or self._read_only:
             return
+        self.edit_started.emit()
         canvas_w, canvas_h = self._layout.canvas
         for placement in self._selected:
             if placement.pos is None:

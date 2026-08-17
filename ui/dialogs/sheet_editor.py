@@ -18,6 +18,7 @@ import copy
 
 from PIL import Image
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -31,6 +32,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -53,6 +55,9 @@ _ALIGN_OPTIONS = [
     ("4 的倍數", PAGE_ALIGN_4),
     ("2 的次方", PAGE_ALIGN_POT),
 ]
+
+# 每張合圖各自保留的復原步數上限（按住方向鍵微調會產生很多步）
+_UNDO_LIMIT = 60
 
 
 class SheetEditorDialog(QDialog):
@@ -78,6 +83,9 @@ class SheetEditorDialog(QDialog):
         self._working: dict[str, SheetLayout] = {}
         self._sources: dict[str, Image.Image | None] = {}
         self._touched: set[str] = set()
+        # Ctrl+Z 的編輯歷史：每張合圖一份（快照存比例/位置/固定/間距/對齊）
+        self._undo_stacks: dict[str, list[tuple]] = {}
+        self._redo_stacks: dict[str, list[tuple]] = {}
         # 開啟這個對話框時「已經套用過」的合圖。點開來看會建一份預覽版面放進
         # _working，但那還不算自訂——只有按過「套用版面」的才算，
         # 所以狀態欄要看這個集合，不能看 _working 有沒有東西。
@@ -157,6 +165,12 @@ class SheetEditorDialog(QDialog):
         footer.addWidget(buttons)
         layout.addLayout(footer)
 
+        # 用明確按鍵而非 StandardKey：StandardKey.Redo 在部分平台已含
+        # Ctrl+Shift+Z，兩個捷徑撞同一組按鍵會變成 ambiguous 而全部失效
+        QShortcut(QKeySequence("Ctrl+Z"), self, self._undo)
+        QShortcut(QKeySequence("Ctrl+Y"), self, self._redo)
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self, self._redo)
+
     def _build_sheet_list(self) -> QWidget:
         column = QWidget()
         column.setMinimumWidth(250)
@@ -227,13 +241,16 @@ class SheetEditorDialog(QDialog):
         self.canvas.selection_changed.connect(self._sync_selection_panel)
         # 拖曳中：只刷新讀數（不重排、不算重疊），拖起來才不會頓
         self.canvas.editing.connect(self._sync_selection_panel)
+        # 拖曳／微調開始改動版面之前先拍快照，Ctrl+Z 才回得到改動前
+        self.canvas.edit_started.connect(lambda: self._push_undo())
         self.canvas.layout_changed.connect(self._on_canvas_edited)
         self.canvas.zoom_changed.connect(lambda _scale: self._sync_canvas_title())
         box.addWidget(self.canvas, 1)
 
         hint = QLabel(
-            "拖曳角落＝等比縮放（可多選一起縮）　拖曳元件＝搬移並固定位置　"
-            "空白處拉框＝多選　Ctrl+A＝全選　方向鍵＝微調　滾輪＝縮放檢視"
+            "拖曳角落＝等比縮放（可多選一起縮，改比例會取消固定）　"
+            "拖曳元件＝搬移並固定位置　空白處拉框＝多選　Ctrl+A＝全選　"
+            "Ctrl+Z＝復原　Ctrl+Y＝重做　方向鍵＝微調　滾輪＝縮放檢視"
         )
         hint.setProperty("role", "hint")
         hint.setWordWrap(True)
@@ -291,6 +308,16 @@ class SheetEditorDialog(QDialog):
 
         row = QHBoxLayout()
         row.addWidget(QLabel("比例"))
+        self.item_slider = QSlider(Qt.Orientation.Horizontal)
+        self.item_slider.setRange(1, int(MAX_REGION_SCALE * 100))
+        self.item_slider.setValue(100)
+        self.item_slider.setToolTip("拖動就套用到選取的元件並自動重新排版")
+        # 拉桿是一個連續手勢：按下時拍一次復原快照就好，
+        # 拖動過程的每一格不再各拍一張（Ctrl+Z 一次回到拖之前）
+        self.item_slider.sliderPressed.connect(lambda: self._push_undo())
+        self.item_slider.valueChanged.connect(self._on_item_slider)
+        row.addWidget(self.item_slider, 1)
+
         self.item_spin = QDoubleSpinBox()
         # 下限刻意留 0：選取的元件比例不一致時用 0 顯示「多個比例」，
         # 使用者輸入任何有效值才會一起改成同一個比例
@@ -299,8 +326,12 @@ class SheetEditorDialog(QDialog):
         self.item_spin.setDecimals(1)
         self.item_spin.setSuffix(" %")
         self.item_spin.setValue(100.0)
+        self.item_spin.setFixedWidth(88)
+        # 打字打到一半（例如想輸入 37 打了 3）就套用會把元件縮到 3%，
+        # 改成按 Enter / 失焦 / 按上下鍵才生效
+        self.item_spin.setKeyboardTracking(False)
         self.item_spin.valueChanged.connect(self._on_item_scale)
-        row.addWidget(self.item_spin, 1)
+        row.addWidget(self.item_spin)
         box.addLayout(row)
 
         buttons = QHBoxLayout()
@@ -578,14 +609,108 @@ class SheetEditorDialog(QDialog):
         self._touched.add(group.key)
         self._refresh_row(group)
 
+    # ------------------------------------------------------------ 復原（Ctrl+Z）
+
+    def _push_undo(self, group: SheetGroup | None = None) -> None:
+        """
+        在「即將改動版面」之前拍一張快照。
+
+        呼叫時機一律在修改前：拖曳／微調由畫布的 edit_started 觸發、
+        拉桿在 sliderPressed、其餘操作在各自 handler 的開頭。
+        連續拍到一模一樣的狀態就跳過（例如點一下沒拖），免得 Ctrl+Z 要按兩次。
+        """
+        group = group or self._current
+        if group is None:
+            return
+        layout = self._working.get(group.key)
+        if layout is None:
+            return
+        snap = _snapshot(layout)
+        stack = self._undo_stacks.setdefault(group.key, [])
+        if stack and stack[-1] == snap:
+            return
+        stack.append(snap)
+        if len(stack) > _UNDO_LIMIT:
+            del stack[0]
+        # 拍了新快照代表要走新的分支，之前重做的路線作廢
+        self._redo_stacks.pop(group.key, None)
+
+    def _undo(self) -> None:
+        self._history_step(self._undo_stacks, self._redo_stacks)
+
+    def _redo(self) -> None:
+        self._history_step(self._redo_stacks, self._undo_stacks)
+
+    def _history_step(self, source: dict[str, list], target: dict[str, list]) -> None:
+        """
+        復原／重做一步（只作用在目前顯示的合圖，每張合圖各自的歷史）。
+
+        直接套回快照，**不**重新排版——快照存的就是當時的完整排版結果，
+        重排會排出另一個版面，那就不是「復原」了。
+        """
+        group = self._current
+        if group is None or len(self._selected_groups()) > 1:
+            return
+        layout = self._working.get(group.key)
+        stack = source.get(group.key)
+        if layout is None or not stack:
+            return
+        target.setdefault(group.key, []).append(_snapshot(layout))
+        _apply_snapshot(layout, stack.pop())
+        self._mark_touched()
+        self._syncing = True
+        try:
+            self.padding_spin.setValue(layout.padding)
+            index = self.align_combo.findData(layout.align)
+            if index >= 0:
+                self.align_combo.setCurrentIndex(index)
+        finally:
+            self._syncing = False
+        if not self.canvas.canvas_fits():
+            self.canvas.fit_to_view()
+        else:
+            self.canvas.update()
+        self._sync_stats()
+        self._sync_selection_panel()
+
     def _on_item_scale(self, value: float) -> None:
-        if self._syncing or value < MIN_REGION_SCALE * 100:
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self.item_slider.setValue(int(round(value)))
+        finally:
+            self._syncing = False
+        self._apply_item_scale(value)
+
+    def _on_item_slider(self, value: int) -> None:
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self.item_spin.setValue(float(value))
+        finally:
+            self._syncing = False
+        self._apply_item_scale(float(value))
+
+    def _apply_item_scale(self, value: float) -> None:
+        """
+        把比例套用到選取的元件，並一併**取消它們的固定**再重排。
+
+        固定的位置是在舊比例下挑的，換了比例就沒有意義；留著只會讓畫布
+        縮不下去（「還原原始版面」會把整張的元件都固定住，之後全選改比例
+        若不解固定，71 個元件全都不准動，重排永遠縮不下去）。
+        """
+        if value < MIN_REGION_SCALE * 100:
             return  # 0 是「多個比例」的顯示值，不是真的要縮到 0
         selected = self.canvas.selected()
         if not selected:
             return
+        if not self.item_slider.isSliderDown():
+            self._push_undo()   # 拉桿手勢在 sliderPressed 已拍過
         for placement in selected:
             placement.set_scale(value / 100.0)
+            placement.pinned = False
         self._mark_touched()
         self._repack(refit=False)
         self._sync_selection_panel()
@@ -605,6 +730,7 @@ class SheetEditorDialog(QDialog):
         layout = self.canvas.layout
         if layout is None:
             return
+        self._push_undo()
         layout.padding = self.padding_spin.value()
         layout.align = self.align_combo.currentData()
         self._mark_touched()
@@ -614,6 +740,7 @@ class SheetEditorDialog(QDialog):
         selected = self.canvas.selected()
         if not selected:
             return
+        self._push_undo()
         for placement in selected:
             placement.pinned = False
         self._mark_touched()
@@ -621,10 +748,14 @@ class SheetEditorDialog(QDialog):
 
     def _unpin_all(self) -> None:
         """整張合圖取消固定並重排（版面縮不下去時的救命按鈕）"""
-        count = self.canvas.unpin_all()
-        if not count:
+        layout = self.canvas.layout
+        if layout is None:
+            return
+        if not any(p.pinned for p in layout.placements):
             self.warn_label.setText("這張合圖沒有被固定的元件")
             return
+        self._push_undo()
+        count = self.canvas.unpin_all()
         self._mark_touched()
         self._repack(force=True)
         if not self.warn_label.text():
@@ -646,6 +777,7 @@ class SheetEditorDialog(QDialog):
             # 還沒有工作副本的直接以 100% 建：build_layout 在 100% 就是
             # 原始版面本身，不用先排一次再還原
             layout = self._ensure_layout(group, scale=1.0)
+            self._push_undo(group)
             layout.reset_to_source()
             self._mark_group_touched(group)
 
@@ -673,11 +805,13 @@ class SheetEditorDialog(QDialog):
             if group is self._current:
                 continue
             layout = self._ensure_layout(group)
+            self._push_undo(group)
             if repack(layout, hint_width=layout.src_canvas[0]):
                 overflowed.append(group.name)
             self._mark_group_touched(group)
 
         if self._current is not None and any(g is self._current for g in groups):
+            self._push_undo()
             self._mark_touched()
             self._repack(force=True)
         self._sync_footer()
@@ -721,8 +855,10 @@ class SheetEditorDialog(QDialog):
         if not selected:
             self.selection_label.setText("未選取任何元件（點一下元件或拉框多選）")
             self.item_spin.setEnabled(False)
+            self.item_slider.setEnabled(False)
             return
         self.item_spin.setEnabled(True)
+        self.item_slider.setEnabled(True)
 
         if len(selected) == 1:
             placement = selected[0]
@@ -748,6 +884,9 @@ class SheetEditorDialog(QDialog):
         self._syncing = True
         try:
             self.item_spin.setValue(next(iter(scales)) * 100 if len(scales) == 1 else 0.0)
+            # 比例不一致時拉桿停在平均值：從那裡開始拉最不突兀
+            average = sum(p.scale for p in selected) / len(selected)
+            self.item_slider.setValue(int(round(average * 100)))
         finally:
             self._syncing = False
 
@@ -845,6 +984,29 @@ class SheetEditorDialog(QDialog):
 
 
 # ---------------------------------------------------------------- 輔助
+
+
+def _snapshot(layout: SheetLayout) -> tuple:
+    """
+    版面的復原快照：畫布、間距、對齊與每個元件的（比例、位置、固定）。
+
+    元件清單在編輯期間只會改屬性、不會增減（增減只發生在開啟時的
+    sync_layout），所以用索引對回去就夠了。
+    """
+    return (
+        layout.canvas,
+        layout.padding,
+        layout.align,
+        tuple((p.scale, p.pos, p.pinned) for p in layout.placements),
+    )
+
+
+def _apply_snapshot(layout: SheetLayout, snap: tuple) -> None:
+    layout.canvas, layout.padding, layout.align = snap[0], snap[1], snap[2]
+    for placement, (scale, pos, pinned) in zip(layout.placements, snap[3]):
+        placement.scale = scale
+        placement.pos = pos
+        placement.pinned = pinned
 
 
 def _name_of(layout: SheetLayout) -> str:

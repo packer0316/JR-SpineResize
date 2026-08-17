@@ -24,7 +24,7 @@ from config import settings as user_settings
 from config.constants import APP_NAME, APP_TITLE, OUTPUT_CUSTOM
 from config.version import VERSION
 from core.log_writer import log_filename, write_settings_log
-from core.pipeline import BatchResult
+from core.pipeline import BatchResult, refresh_overwritten_sources
 from core.project_file import (
     FILE_EXTENSION,
     FILE_FILTER,
@@ -914,6 +914,14 @@ class MainWindow(QMainWindow):
             self._progress.accept()
             self._progress = None
         self._process_worker = None
+        # 覆蓋模式改寫了來源檔：記憶體裡的 atlas 資料與自訂版面要跟著更新，
+        # 否則合圖編輯器會拿舊座標裁新貼圖（顯示跑版），清單欄位也全是舊值
+        overwritten = refresh_overwritten_sources(batch, self._layouts)
+        if overwritten:
+            for project in self.project_list.projects:
+                if any(layout_key(p) in overwritten for p in project.page_paths):
+                    self._preview_cache.pop(id(project), None)
+            self._sync_layout_marks()
         self.project_list.refresh_all()
         self._update_footer()
         ReportDialog(batch, skipped, self).exec()

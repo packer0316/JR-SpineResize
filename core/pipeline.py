@@ -53,7 +53,7 @@ from core.validator import (
 from models.atlas_data import AtlasFile
 from models.compression_options import CompressionOptions
 from models.process_options import ProcessOptions
-from models.sheet_layout import LayoutStore, SheetLayout
+from models.sheet_layout import LayoutStore, SheetLayout, layout_key
 from models.size_estimate import PageEstimate, SizeEstimate
 from models.spine_asset import SpineAsset
 from utils.file_utils import copy_file, longest_matching_root
@@ -150,6 +150,47 @@ def _output_name(original: str, suffix: str) -> str:
         return original
     path = Path(original)
     return str(path.with_name(f"{path.stem}{suffix}{path.suffix}"))
+
+
+def refresh_overwritten_sources(
+    batch: "BatchResult", layouts: LayoutStore | None
+) -> set[str]:
+    """
+    覆蓋模式處理完成後，把被改寫的來源重新讀進記憶體。
+
+    處理本身每次都從磁碟重新解析（見 process_asset），所以輸出永遠正確；
+    但「覆蓋原檔」寫回去之後，UI 掃描時解析的 atlas 資料仍是舊的——
+    合圖編輯器會拿舊座標去裁新貼圖（顯示整個跑版、超界的框變空白），
+    頁面尺寸等欄位也都是舊值，直到使用者重新載入才恢復。
+
+    這裡做兩件事，讓記憶體跟上磁碟：
+
+    * 被覆蓋的 atlas 重新解析（尺寸、區塊座標都换成輸出後的新值）
+    * 被覆蓋貼圖的自訂版面從版面庫移除——版面的結果已經寫進檔案，
+      新檔案就是新的基準，留著只會跟新座標對不上
+
+    Returns:
+        被覆蓋貼圖的 layout_key 集合（呼叫端用來清相關快取）。
+    """
+    overwritten: set[str] = set()
+    for result in batch.succeeded:
+        for page in result.pages:
+            if (
+                page.src_path is not None
+                and page.dst_path is not None
+                and layout_key(page.src_path) == layout_key(page.dst_path)
+            ):
+                overwritten.add(layout_key(page.src_path))
+                if layouts is not None:
+                    layouts.remove(page.src_path)
+        if result.atlas_out is not None and layout_key(result.atlas_out) == layout_key(
+            result.asset.atlas_path
+        ):
+            try:
+                result.asset.atlas = parse_atlas_file(result.asset.atlas_path)
+            except AtlasParseError:
+                pass  # 解析失敗就先留舊資料，重新載入時自然會更新
+    return overwritten
 
 
 # 壓縮引擎無內部狀態，共用一個實例即可

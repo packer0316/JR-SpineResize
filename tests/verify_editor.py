@@ -26,6 +26,8 @@
     自訂間距、還原的恆等版面）與套用的設定，存檔重開後逐欄位相同
 14. Ctrl+Z 復原／Ctrl+Y 重做：比例、位置、固定狀態、還原原始版面
     都能一步一步退回（每張合圖各自的歷史）
+15. 覆蓋輸出後記憶體要跟上磁碟：atlas 資料重新解析、已消耗的版面移除，
+    處理完回編輯器不再拿舊座標裁新貼圖（跑版）；同步前開編輯器要警告
 
 第 1 ~ 3 點是為了鎖住一個修過的 bug：縮放比例原本以「當下的選取範圍」為基準，
 元件變大會讓基準跟著變大 → 比例變小 → 元件縮回去，滑鼠沒動也會在兩個尺寸
@@ -47,7 +49,7 @@ from PyQt6.QtWidgets import QApplication
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.pipeline import process_asset
+from core.pipeline import BatchResult, process_asset, refresh_overwritten_sources
 from core.project_file import load_project_file, save_project_file
 from core.project_scanner import scan_projects
 from core.sheet_group import build_sheet_groups
@@ -575,6 +577,70 @@ def main() -> int:
             f"「還原原始版面」也能 Ctrl+Z 退回 -> {u_layout.canvas}",
         )
         undo_dlg.close()
+
+        print("\n[15] 覆蓋輸出後記憶體與磁碟同步")
+        work4 = Path(tempfile.mkdtemp(prefix="jreditor4_"))
+        try:
+            build_sheet(work4)
+            projects4 = scan_projects([work4])
+            groups4 = build_sheet_groups(projects4)
+            store4 = LayoutStore()
+
+            # 造一份 50% 的自訂版面
+            editor4 = SheetEditorDialog(groups=groups4, layouts=store4, default_scale=1.0)
+            editor4.show()
+            app.processEvents()
+            editor4.canvas.select_all()
+            editor4.item_spin.setValue(50.0)
+            app.processEvents()
+            committed4, _ = editor4.result_layouts()
+            editor4.close()
+            for item in committed4:
+                store4.put(item)
+            new_canvas = committed4[0].canvas
+
+            # 覆蓋輸出（預設就是 inplace、無後綴）——來源檔被改寫
+            batch4 = BatchResult()
+            rendered4: dict = {}
+            for project in projects4:
+                for asset in project.atlases:
+                    if not asset.is_loadable or asset.missing_pages:
+                        continue
+                    batch4.results.append(process_asset(
+                        asset, ProcessOptions(), rendered_pages=rendered4, layouts=store4
+                    ))
+            check(bool(batch4.results) and all(r.ok for r in batch4.results),
+                  f"覆蓋輸出成功（{len(batch4.results)} 份）")
+
+            # 同步之前：記憶體還是舊座標，開編輯器必須警告尺寸不符（跑版的成因）
+            stale = SheetEditorDialog(groups=groups4, layouts=store4, default_scale=1.0)
+            stale.show()
+            app.processEvents()
+            check(bool(stale._size_mismatch),
+                  "同步前開編輯器 -> 偵測到貼圖與 atlas 宣告不符並警告")
+            stale.close()
+
+            # 同步：重新解析被覆蓋的 atlas、移除已消耗的版面
+            overwritten = refresh_overwritten_sources(batch4, store4)
+            asset4 = next(a for p in projects4 for a in p.atlases if a.is_loadable)
+            check(bool(overwritten) and asset4.atlas.pages[0].size == new_canvas,
+                  f"atlas 記憶體資料已更新 -> {asset4.atlas.pages[0].size}")
+            check(len(store4) == 0, "已消耗的自訂版面移除")
+
+            # 重建群組再開編輯器：尺寸相符、內容乾淨（不再跑版）
+            groups4b = build_sheet_groups(projects4)
+            viewer4 = SheetEditorDialog(groups=groups4b, layouts=store4, default_scale=1.0)
+            viewer4.show()
+            app.processEvents()
+            v_layout = viewer4.canvas.layout
+            check(
+                v_layout is not None and v_layout.src_canvas == new_canvas
+                and not viewer4._size_mismatch,
+                f"同步後編輯器與磁碟一致 -> {v_layout.src_canvas}、無警告",
+            )
+            viewer4.close()
+        finally:
+            shutil.rmtree(work4, ignore_errors=True)
 
         print("\n全部通過" if not failed else f"\n失敗 {failed} 項")
         return 1 if failed else 0

@@ -82,6 +82,10 @@ class SheetEditorDialog(QDialog):
         # 工作副本：取消時原本的版面完全不動
         self._working: dict[str, SheetLayout] = {}
         self._sources: dict[str, Image.Image | None] = {}
+        # 貼圖實際尺寸與 atlas 宣告不符的合圖（鍵 -> 實際尺寸）。
+        # 正常流程不會發生（處理完成會同步記憶體），但檔案在外部被改寫時
+        # 要明確警告，而不是默默拿舊座標裁新貼圖畫出跑版的內容
+        self._size_mismatch: dict[str, tuple[int, int]] = {}
         self._touched: set[str] = set()
         # Ctrl+Z 的編輯歷史：每張合圖一份（快照存比例/位置/固定/間距/對齊）
         self._undo_stacks: dict[str, list[tuple]] = {}
@@ -535,6 +539,8 @@ class SheetEditorDialog(QDialog):
                 image = handle.convert("RGBA")
         except OSError:
             image = None
+        if image is not None and image.size != group.src_canvas:
+            self._size_mismatch[group.key] = image.size
         self._sources[group.key] = image
         return image
 
@@ -924,6 +930,15 @@ class SheetEditorDialog(QDialog):
         overlaps = _overlapping(layout)
         self.canvas.set_overlapping(overlaps)
         messages = []
+        mismatch = (
+            self._size_mismatch.get(self._current.key) if self._current is not None else None
+        )
+        if mismatch:
+            messages.append(
+                f"貼圖實際尺寸 {mismatch[0]}x{mismatch[1]} 與 atlas 宣告的 "
+                f"{src_w}x{src_h} 不符——檔案可能已在外部被改寫，"
+                "畫面內容不可信，請重新載入專案再編輯"
+            )
         if overlaps:
             messages.append(
                 f"{len(overlaps)} 個元件互相重疊（多半是固定位置後又改了大小）——"

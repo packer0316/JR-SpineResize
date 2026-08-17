@@ -21,6 +21,8 @@
     「原始版面等比縮小」永遠是排版的候選之一，比啟發式差就不採用
 12. 清單可多選合圖：「重新排版」與「還原原始版面」一次套用到全部選取，
     其他控制項停用、畫布唯讀
+13. 專案檔 round-trip：編輯器做得出來的每一種版面（混合比例、固定位置、
+    自訂間距、還原的恆等版面）與套用的設定，存檔重開後逐欄位相同
 
 第 1 ~ 3 點是為了鎖住一個修過的 bug：縮放比例原本以「當下的選取範圍」為基準，
 元件變大會讓基準跟著變大 → 比例變小 → 元件縮回去，滑鼠沒動也會在兩個尺寸
@@ -43,6 +45,7 @@ from PyQt6.QtWidgets import QApplication
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.pipeline import process_asset
+from core.project_file import load_project_file, save_project_file
 from core.project_scanner import scan_projects
 from core.sheet_group import build_sheet_groups
 from models.process_options import ProcessOptions
@@ -437,6 +440,86 @@ def main() -> int:
             multi.close()
         finally:
             shutil.rmtree(work2, ignore_errors=True)
+
+        print("\n[13] 專案檔完整還原合圖版面與設定")
+        work3 = Path(tempfile.mkdtemp(prefix="jreditor3_"))
+        try:
+            build_sheet(work3, "sheet")
+            build_sheet(work3, "extra")
+            projects3 = scan_projects([work3])
+            groups3 = build_sheet_groups(projects3)
+            store3 = LayoutStore()
+            editor3 = SheetEditorDialog(groups=groups3, layouts=store3, default_scale=1.0)
+            editor3.show()
+            app.processEvents()
+
+            # 第一張：混合比例 + 方向鍵搬移（會固定）+ 自訂間距——把能改的都改
+            editor3.sheet_table.selectRow(0)
+            app.processEvents()
+            layout_a = editor3.canvas.layout
+            editor3.canvas.select([layout_a.placements[0]])
+            editor3.item_spin.setValue(37.0)
+            app.processEvents()
+            editor3.canvas.select([layout_a.placements[1]])
+            editor3.canvas.nudge(3, 2)
+            app.processEvents()
+            editor3.padding_spin.setValue(5)
+            app.processEvents()
+
+            # 第二張：還原原始版面（恆等版面也要能存能讀）
+            editor3.sheet_table.selectRow(1)
+            app.processEvents()
+            editor3._revert_selected()
+            app.processEvents()
+            identity_path = editor3.canvas.layout.page_path
+
+            committed3, _ = editor3.result_layouts()
+            editor3.close()
+            for item in committed3:
+                store3.put(item)
+            check(len(store3) == 2, f"編輯 2 張版面 -> {len(store3)} 張")
+
+            wanted = ProcessOptions(resize_enabled=True, scale_percent=50)
+            for project in projects3:
+                project.applied_options = ProcessOptions(resize_enabled=True, scale_percent=50)
+
+            saved_path = save_project_file(projects3, work3 / "roundtrip", [work3], store3)
+            loaded = load_project_file(saved_path)
+            check(
+                len(loaded.projects) == len(projects3) and loaded.applied == len(projects3),
+                f"專案與設定還原 -> {len(loaded.projects)} 份、已套用 {loaded.applied} 份",
+            )
+            check(
+                all(
+                    p.applied_options is not None
+                    and p.applied_options.render_fingerprint() == wanted.render_fingerprint()
+                    for p in loaded.projects
+                ),
+                "套用的設定逐欄位相同",
+            )
+
+            mismatch = [
+                item.page_path.name
+                for item in store3
+                if (restored := loaded.layouts.get(item.page_path)) is None
+                or restored.to_dict() != item.to_dict()
+            ]
+            check(not mismatch, f"版面逐欄位相同（含比例/位置/固定/名稱/間距/對齊）{mismatch or ''}")
+
+            restored_a = loaded.layouts.get(layout_a.page_path)
+            check(
+                restored_a is not None
+                and any(p.pinned for p in restored_a.placements)
+                and restored_a.padding == 5,
+                "固定位置與自訂間距有存進專案檔",
+            )
+            restored_identity = loaded.layouts.get(identity_path)
+            check(
+                restored_identity is not None and restored_identity.is_identity,
+                "「還原原始版面」的恆等版面照樣還原",
+            )
+        finally:
+            shutil.rmtree(work3, ignore_errors=True)
 
         print("\n全部通過" if not failed else f"\n失敗 {failed} 項")
         return 1 if failed else 0

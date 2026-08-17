@@ -418,13 +418,16 @@ class MainWindow(QMainWindow):
         self._source_roots = list(result.source_roots)
         self._layouts = result.layouts
         self.project_list.set_projects(result.projects)
+        # 先把載入的版面對齊到目前素材，再同步標示與估算：對齊可能改動版面
+        # （元件增減、畫布尺寸變了），順序反了的話頁面尺寸欄與容量估算
+        # 會先用到對齊前的版面
+        stale = self._stale_layout_notes(result.projects)
         self._sync_layout_marks()
         self._update_footer()
         self._start_estimates()
         self.status_label.setText(describe_load(result))
 
         notes = []
-        stale = self._stale_layout_notes(result.projects)
         if stale:
             notes.append(stale)
         if result.missing:
@@ -443,10 +446,12 @@ class MainWindow(QMainWindow):
 
     def _stale_layout_notes(self, projects: list[SpineProject]) -> str:
         """
-        載入的合圖版面與現在的素材對不上時的說明。
+        把載入的合圖版面對齊到目前的素材，回傳給使用者看的說明。
 
         素材被重新匯出（區塊位置變了）時版面就過期了，直接沿用會讓 atlas
-        與貼圖對不上。這裡只回報，並把過期的版面移掉，讓它回到全域比例。
+        與貼圖對不上。sync_layout 會移除已消失的元件、補上新增的並重排，
+        這裡回報哪些張被動到，讓使用者知道要進「合圖編輯」確認。
+        （呼叫端要在這之後才同步標示與估算，拿到的才是對齊後的版面。）
         """
         groups = {g.key: g for g in build_sheet_groups(projects)}
         stale: list[str] = []
@@ -458,7 +463,6 @@ class MainWindow(QMainWindow):
             if notes:
                 stale.append(f"{group.name}：{'、'.join(notes)}")
         if stale:
-            self._sync_layout_marks()
             return (
                 f"有 {len(stale)} 張合圖的版面已依目前素材重新對齊，請進「合圖編輯」確認：\n"
                 + "\n".join(stale[:6])

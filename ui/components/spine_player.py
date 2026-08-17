@@ -5,7 +5,7 @@ Spine 播放器元件
 * 動畫選單（含 Setup Pose）與 skin 選單（多 skin 時）
 * 播放/暫停、時間軸拖曳
 * 「原始 / 縮放後」貼圖切換——同一副骨架換貼圖庫，直接對比縮放品質
-* 滾輪縮放、拖曳平移、自動取景
+* 滾輪縮放、拖曳平移、載入時自動取景，以及「原比例 1:1」看原始尺寸
 """
 from __future__ import annotations
 
@@ -87,6 +87,24 @@ class _Viewport(QWidget):
         self.center_x = (x0 + x1) / 2
         self.center_y = (y0 + y1) / 2
         self.zoom = min(self.width() / w, self.height() / h) * 0.85
+        self._fitted = True
+        self.update()
+
+    def actual_size(self) -> None:
+        """
+        1:1 原比例——骨架的 1 個單位對到螢幕上的 1 個實體像素。
+
+        骨架的世界座標本來就是原始貼圖的像素單位，所以這個縮放下看到的
+        就是素材的原始尺寸，切換「原始 / 縮放後」才能真的比出品質差異。
+        除以 devicePixelRatio 是因為 QPainter 走的是邏輯像素，Windows
+        放大顯示（125% 等）時不除會被重採樣，就不是逐像素對齊了。
+        """
+        self.zoom = 1.0 / max(self.devicePixelRatioF(), 0.01)
+        if self.renderer is not None and self.renderer.last_bounds is not None:
+            x0, y0, x1, y1 = self.renderer.last_bounds
+            self.center_x = (x0 + x1) / 2
+            self.center_y = (y0 + y1) / 2
+        # 擋掉 paintEvent 的首次自動取景，否則剛設好的 1:1 會被蓋掉
         self._fitted = True
         self.update()
 
@@ -226,10 +244,14 @@ class SpinePlayer(QWidget):
         self.source_button.clicked.connect(self._toggle_source)
         bar.addWidget(self.source_button)
 
-        fit_button = QPushButton("取景")
-        fit_button.setFixedWidth(52)
-        fit_button.clicked.connect(lambda: self.viewport.fit())
-        bar.addWidget(fit_button)
+        actual_button = QPushButton("原比例 1:1")
+        actual_button.setFixedWidth(88)
+        actual_button.setToolTip(
+            "以 1:1 顯示：骨架 1 單位 = 螢幕 1 像素，看素材的原始尺寸\n"
+            "（切換「原始 / 縮放後」時要在這個比例下才比得出品質差異）"
+        )
+        actual_button.clicked.connect(lambda: self.viewport.actual_size())
+        bar.addWidget(actual_button)
 
         self.grid_check = QCheckBox("格線")
         self.grid_check.setChecked(True)

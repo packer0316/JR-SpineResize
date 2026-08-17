@@ -1,4 +1,4 @@
-"""主視窗：左＝skel 專案清單、中＝檔案與播放預覽、右＝縮放設定與套用"""
+"""主視窗：左＝skel 專案清單與檔案、中＝Spine 播放預覽、右＝縮放設定與套用"""
 from __future__ import annotations
 
 import copy
@@ -94,16 +94,17 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        splitter.addWidget(self._build_project_column())
-
+        # 先建好詳細面板，左欄才拿得到要搬下去的「檔案」面板
         self.detail = ProjectDetail()
         self.detail.setMinimumWidth(380)
-        splitter.addWidget(self.detail)
 
+        splitter.addWidget(self._build_project_column())
+        splitter.addWidget(self.detail)
         splitter.addWidget(self._build_settings_column())
 
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 5)
+        # 中欄現在只有預覽，視窗變寬時多分一點給它
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 6)
         splitter.setStretchFactor(2, 0)
         # 左欄要放得下八個欄位（含合圖與容量變化），預設給寬一點免得一開就出現橫向捲軸
         splitter.setSizes([680, 400, 400])
@@ -205,7 +206,7 @@ class MainWindow(QMainWindow):
         return line
 
     def _build_project_column(self) -> QWidget:
-        """左欄：篩選列 + 專案清單"""
+        """左欄：篩選列 + 專案清單 + 檔案面板（在 ``self.detail`` 之後才能呼叫）"""
         column = QWidget()
         column.setMinimumWidth(360)
         layout = QVBoxLayout(column)
@@ -222,6 +223,9 @@ class MainWindow(QMainWindow):
         self.project_list.edit_sheet_requested.connect(self._open_sheet_editor)
         self.project_list.rows_rebuilt.connect(self._sync_filter_counts)
         layout.addWidget(self.project_list, 1)
+
+        # 「檔案」面板原本在中欄上方，搬到左下角把整個中欄讓給 Spine 預覽
+        layout.addWidget(self.detail.detach_files_panel())
         return column
 
     def _build_settings_column(self) -> QWidget:

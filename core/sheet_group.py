@@ -216,53 +216,158 @@ class SheetGroup:
 
 def repack(layout: SheetLayout, hint_width: int = 0) -> list[Placement]:
     """
-    重新排版並把畫布縮到最小；回傳排不進去的元件（正常情況是空的）。
+    重新排版並把每一頁的畫布縮到最小；回傳排不進去的元件（正常情況是空的）。
 
+    版面可以拆成多個輸出頁（``placement.page``），每一頁**獨立**排版：
     手動搬過的元件（``pinned``）位置固定，其餘自動填空隙。
+    沒有任何元件的頁維持與原圖一樣大——新增的空白頁在使用者丟入元件
+    之前不縮排，才有地方可以放。
 
     「原始版面等比縮小」永遠是候選之一：整組同一個比例時，把原版面照比例
     縮小也是一個合法排法（原檔是美術工具排的，常比啟發式排得更緊）。
     兩者比面積取小，所以結果**永遠不會比原版面差**——100% 時該候選就是
-    原版面本身，保證面積不變大。
+    原版面本身，保證面積不變大。拆頁後原版面的相對位置不再成立，不做此比較。
     """
-    items = [
-        PackItem(
-            key=placement,
-            width=placement.dst_size[0],
-            height=placement.dst_size[1],
-            fixed=placement.pos if placement.pinned else None,
-        )
-        for placement in layout.placements
-    ]
-    result = pack(
-        items,
-        padding=layout.padding,
-        align=layout.align,
-        hint_width=hint_width or layout.src_canvas[0],
-    )
-    for item in items:
-        position = result.positions.get(id(item))
-        if position is not None:
-            item.key.pos = position  # type: ignore[union-attr]
-    layout.canvas = result.canvas
-    overflow = [item.key for item in result.overflow]  # type: ignore[misc]
-    if not overflow:
+    hint = hint_width or layout.src_canvas[0]
+    overflow: list[Placement] = []
+    for index in range(layout.page_count):
+        members = layout.placements_on(index)
+        if not members:
+            layout.set_page_canvas(index, layout.src_canvas)
+            continue
+        items = [
+            PackItem(
+                key=placement,
+                width=placement.dst_size[0],
+                height=placement.dst_size[1],
+                fixed=placement.pos if placement.pinned else None,
+            )
+            for placement in members
+        ]
+        result = pack(items, padding=layout.padding, align=layout.align, hint_width=hint)
+        for item in items:
+            position = result.positions.get(id(item))
+            if position is not None:
+                item.key.pos = position  # type: ignore[union-attr]
+        layout.set_page_canvas(index, result.canvas)
+        overflow.extend(item.key for item in result.overflow)  # type: ignore[misc]
+    if not overflow and not layout.extra_pages:
         _prefer_source_baseline(layout)
+    # 固定住的元件互相壓到時打包器不會動它們——重疊絕不允許，最後強制排開
+    resolve_overlaps(layout)
     return overflow
+
+
+def _clashing_ids(members: list[Placement]) -> set[int]:
+    """同一頁內互相重疊的元件 id 集合（呼叫端保證 members 同頁且已排版）"""
+    clashed: set[int] = set()
+    for index, first in enumerate(members):
+        ax, ay, aw, ah = first.dst_rect
+        for second in members[index + 1:]:
+            bx, by, bw, bh = second.dst_rect
+            if bx >= ax + aw or bx + bw <= ax or by >= ay + ah or by + bh <= ay:
+                continue
+            clashed.add(id(first))
+            clashed.add(id(second))
+    return clashed
+
+
+def overlapping_placements(layout: SheetLayout) -> list[Placement]:
+    """
+    找出互相重疊的元件（同一頁才算數；不同輸出頁不可能互相干擾）。
+
+    元件以「來源矩形」為身分、建群組時已去重，所以兩個元件疊在同一個
+    位置**必然**是錯的（畫的是不同來源的像素）——完全重合也算重疊。
+    atlas 區塊層級的「打包器去重別名」在元件層已被合併成同一個元件，
+    不會出現在這裡。
+    """
+    result: list[Placement] = []
+    for index in range(layout.page_count):
+        members = [p for p in layout.placements_on(index) if p.pos is not None]
+        clashed = _clashing_ids(members)
+        result.extend(p for p in members if id(p) in clashed)
+    return result
+
+
+def resolve_overlaps(
+    layout: SheetLayout, keep: list[Placement] | None = None
+) -> list[Placement]:
+    """
+    把重疊的元件排開——**元件不可重疊**是這個工具最嚴重的規定
+    （重疊的區塊會讓 UV 取到別張圖），任何操作結束後都不允許存在。
+
+    ``keep`` 是剛被使用者放下的元件：位置優先保住，被壓到的讓開；
+    keep 之間互相壓到時只保得住排在前面的。被搬動的元件會取消固定
+    （那個位置已經不是使用者挑的）。沒有重疊時不動任何東西。
+
+    Returns:
+        實際被搬動的元件。
+    """
+    keep_ids = {id(p) for p in (keep or [])}
+    moved: list[Placement] = []
+    for index in range(layout.page_count):
+        members = [p for p in layout.placements_on(index) if p.pos is not None]
+        involved = _clashing_ids(members)
+        if not involved:
+            continue
+        victim_ids = involved - keep_ids
+        # 留在原位的元件彼此不能再重疊（打包器不會動固定的東西）；
+        # 仍互撞就把排在後面的降級成要重排的
+        while True:
+            stay = [p for p in members if id(p) not in victim_ids]
+            still = _clashing_ids(stay)
+            if not still:
+                break
+            victim_ids.add(next(id(p) for p in reversed(stay) if id(p) in still))
+
+        items = [
+            PackItem(
+                key=placement,
+                width=placement.dst_size[0],
+                height=placement.dst_size[1],
+                fixed=None if id(placement) in victim_ids else placement.pos,
+            )
+            for placement in members
+        ]
+        result = pack(
+            items, padding=layout.padding, align=layout.align,
+            hint_width=layout.src_canvas[0],
+        )
+        if result.overflow:
+            # 保住位置會超出頁面上限：整頁自由重排，至少絕不能留下重疊
+            victim_ids = {id(p) for p in members}
+            items = [
+                PackItem(key=p, width=p.dst_size[0], height=p.dst_size[1])
+                for p in members
+            ]
+            result = pack(
+                items, padding=layout.padding, align=layout.align,
+                hint_width=layout.src_canvas[0],
+            )
+        for item in items:
+            position = result.positions.get(id(item))
+            if position is not None:
+                item.key.pos = position  # type: ignore[union-attr]
+        layout.set_page_canvas(index, result.canvas)
+        for placement in members:
+            if id(placement) in victim_ids:
+                placement.pinned = False
+                moved.append(placement)
+    return moved
 
 
 def _prefer_source_baseline(layout: SheetLayout) -> None:
     """
     把「原始版面等比縮小」當候選，比排版結果小（或相等）就採用它。
 
-    只在「整組同一個比例、沒有任何固定位置」時有意義：比例不一致或有元件
-    被手動搬過，原版面的相對位置就不再成立。相等面積時偏好原版面——
-    與原檔的 diff 最小，肉眼比對也容易。
+    只在「整組同一個比例、沒有任何固定位置、沒有拆頁」時有意義：比例不一致、
+    有元件被手動搬過或拆到別頁，原版面的相對位置就不再成立。
+    相等面積時偏好原版面——與原檔的 diff 最小，肉眼比對也容易。
     """
     scale = layout.uniform_scale
-    if scale is None or not layout.placements:
+    if scale is None or not layout.placements or layout.extra_pages:
         return
-    if any(p.pinned for p in layout.placements):
+    if any(p.pinned or p.page != 0 for p in layout.placements):
         return
 
     exact = abs(scale - 1.0) < 1e-9

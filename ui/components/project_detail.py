@@ -1,4 +1,9 @@
-"""選定專案的詳細面板：檔案清單（含處理後大小預估）+ Spine 播放預覽"""
+"""
+選定專案的詳細面板：檔案清單（含處理後大小預估）+ Spine 播放預覽
+
+兩塊預設上下疊；主視窗會呼叫 :meth:`ProjectDetail.detach_files_panel`
+把檔案清單搬到左欄下方，中欄就整個留給預覽。
+"""
 from __future__ import annotations
 
 from PIL import Image
@@ -39,8 +44,8 @@ class ProjectDetail(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        files_group = QGroupBox("檔案")
-        files_layout = QVBoxLayout(files_group)
+        self.files_group = QGroupBox("檔案")
+        files_layout = QVBoxLayout(self.files_group)
         self.files_table = QTableWidget(0, len(_FILE_COLUMNS))
         self.files_table.setHorizontalHeaderLabels(_FILE_COLUMNS)
         self.files_table.verticalHeader().setVisible(False)
@@ -62,7 +67,7 @@ class ProjectDetail(QWidget):
         self.size_summary.setProperty("role", "stat")
         self.size_summary.setWordWrap(True)
         files_layout.addWidget(self.size_summary)
-        layout.addWidget(files_group)
+        layout.addWidget(self.files_group)
 
         preview_group = QGroupBox("Spine 預覽")
         preview_layout = QVBoxLayout(preview_group)
@@ -73,6 +78,18 @@ class ProjectDetail(QWidget):
         self.preview_hint.setWordWrap(True)
         preview_layout.addWidget(self.preview_hint)
         layout.addWidget(preview_group, 1)
+
+    def detach_files_panel(self) -> QGroupBox:
+        """
+        把「檔案」面板從自己的排版取出來交給呼叫端自己擺。
+
+        呼叫端一定要接著 ``addWidget`` 收下它（addWidget 會自動接管親子關係），
+        否則它會變成沒被排版的孤兒 widget，疊在預覽上面。剩下的預覽區會吃掉
+        整個高度，而檔案清單的資料流（``show_project`` / ``apply_estimate``）
+        完全不受影響——那些都只碰 ``files_table``，跟它擺在哪一欄無關。
+        """
+        self.layout().removeWidget(self.files_group)
+        return self.files_group
 
     # ------------------------------------------------------------ 載入
 

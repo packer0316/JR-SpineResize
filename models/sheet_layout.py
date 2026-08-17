@@ -52,6 +52,35 @@ Rect = tuple[int, int, int, int]
 
 
 @dataclass
+class SheetPage:
+    """
+    拆分出來的額外輸出頁（page 0 是原本的貼圖檔，不在這個清單裡）。
+
+    一張合圖可以拆成多張輸出：特效一張、材質一張之類的整理需求。
+    ``name`` 是輸出檔名（含副檔名，例如 ``AzureDragon_2.png``），
+    也會成為 atlas 裡新頁面的名稱——Spine 的 attachment 只認區塊名稱，
+    區塊搬到哪一頁都不影響 .skel，所以拆頁是安全的。
+    """
+
+    name: str
+    canvas: tuple[int, int] = (0, 0)
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "canvas": list(self.canvas)}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SheetPage | None":
+        try:
+            name = str(data.get("name", ""))
+            if not name:
+                return None
+            canvas = [int(v) for v in data.get("canvas", [0, 0])]
+            return cls(name=name, canvas=(canvas[0], canvas[1]))
+        except (TypeError, ValueError, IndexError):
+            return None
+
+
+@dataclass
 class Placement:
     """
     合圖上的一個元件。
@@ -59,6 +88,8 @@ class Placement:
     ``src_rect`` 是它在**原始貼圖**上佔的矩形（已含旋轉，也就是實際像素矩形），
     同時當作跨 atlas 的身分。``scale`` 是相對原始像素的等比縮放，
     ``pos`` 是重新排版後的左上角；``pos`` 為 None 表示還沒排版。
+    ``page`` 是輸出頁索引：0 = 原本那張貼圖，1..N = 拆分出去的新頁，
+    ``pos`` 永遠是**該頁內**的區域座標。
     """
 
     src_rect: Rect
@@ -68,6 +99,8 @@ class Placement:
     pinned: bool = False
     # 這塊像素對應的區塊名稱（可能來自多份 atlas，僅供介面顯示）
     names: list[str] = field(default_factory=list)
+    # 輸出頁索引（0 = 主頁；拆分頁見 SheetLayout.extra_pages）
+    page: int = 0
 
     # ------------------------------------------------------------ 幾何
 
@@ -120,6 +153,7 @@ class Placement:
             "pos": list(self.pos) if self.pos is not None else None,
             "pinned": self.pinned,
             "names": list(self.names),
+            "page": self.page,
         }
 
     @classmethod
@@ -135,6 +169,7 @@ class Placement:
                 pos=pos,
                 pinned=bool(data.get("pinned", False)),
                 names=[str(n) for n in data.get("names", [])],
+                page=max(0, int(data.get("page", 0))),
             )
             placement.set_scale(float(data.get("scale", 1.0)))
             return placement
@@ -158,6 +193,8 @@ class SheetLayout:
     padding: int = 2
     align: int = PAGE_ALIGN_NONE
     placements: list[Placement] = field(default_factory=list)
+    # 拆分出來的額外輸出頁（索引 1..N；主頁 canvas 仍在上面的 canvas 欄位）
+    extra_pages: list[SheetPage] = field(default_factory=list)
 
     # ------------------------------------------------------------ 查詢
 
@@ -167,9 +204,71 @@ class SheetLayout:
 
     @property
     def is_packed(self) -> bool:
-        return self.canvas[0] > 0 and self.canvas[1] > 0 and all(
-            p.pos is not None for p in self.placements
+        return (
+            self.canvas[0] > 0 and self.canvas[1] > 0
+            and all(p.canvas[0] > 0 and p.canvas[1] > 0 for p in self.extra_pages)
+            and all(p.pos is not None for p in self.placements)
         )
+
+    # ------------------------------------------------------------ 輸出頁
+
+    @property
+    def page_count(self) -> int:
+        return 1 + len(self.extra_pages)
+
+    def page_name(self, index: int) -> str:
+        """輸出頁的檔名（0 = 原本的貼圖檔）"""
+        if index <= 0:
+            return self.page_path.name
+        return self.extra_pages[index - 1].name
+
+    def page_canvas(self, index: int) -> tuple[int, int]:
+        if index <= 0:
+            return self.canvas
+        return self.extra_pages[index - 1].canvas
+
+    def set_page_canvas(self, index: int, size: tuple[int, int]) -> None:
+        if index <= 0:
+            self.canvas = size
+        else:
+            self.extra_pages[index - 1].canvas = size
+
+    def placements_on(self, index: int) -> list[Placement]:
+        return [p for p in self.placements if p.page == index]
+
+    def add_page(self, name: str) -> int:
+        """
+        新增一個拆分頁，回傳它的頁索引。
+
+        空白頁的畫布先跟原圖一樣大（讓使用者有地方放元件），
+        丟入元件之後 repack 才開始把它縮到最小。
+        """
+        self.extra_pages.append(SheetPage(name=name, canvas=self.src_canvas))
+        return len(self.extra_pages)
+
+    def prune_empty_pages(self) -> list[str]:
+        """
+        移除沒有任何元件的拆分頁（套用時呼叫），回傳被移除的頁名。
+
+        空頁輸出只是一張全透明的貼圖，浪費容量也沒有意義；
+        主頁（index 0）不在此列——主頁空掉是錯誤，由呼叫端擋下。
+        """
+        used = {p.page for p in self.placements}
+        removed: list[str] = []
+        remap: dict[int, int] = {0: 0}
+        kept: list[SheetPage] = []
+        for old_index, page in enumerate(self.extra_pages, start=1):
+            if old_index in used:
+                kept.append(page)
+                remap[old_index] = len(kept)
+            else:
+                removed.append(page.name)
+        if not removed:
+            return []
+        self.extra_pages = kept
+        for placement in self.placements:
+            placement.page = remap.get(placement.page, 0)
+        return removed
 
     @property
     def uniform_scale(self) -> float | None:
@@ -188,10 +287,12 @@ class SheetLayout:
         貼圖也是逐塊 1:1 複製（``resize_block`` 對同尺寸會直接回傳原內容），
         所以連 PNG 的像素都不會變。用來把某張合圖排除在全域縮放之外。
         """
-        if not self.placements or self.canvas != self.src_canvas:
+        if not self.placements or self.canvas != self.src_canvas or self.extra_pages:
             return False
         return all(
-            abs(p.scale - 1.0) < 1e-9 and p.pos == (p.src_rect[0], p.src_rect[1])
+            abs(p.scale - 1.0) < 1e-9
+            and p.pos == (p.src_rect[0], p.src_rect[1])
+            and p.page == 0
             for p in self.placements
         )
 
@@ -203,11 +304,15 @@ class SheetLayout:
         使用者一旦再調整（改比例、重排），就照一般規則整張重新排版。
         以前這裡把全部元件標成 pinned，結果還原後再調整任何一個元件，
         其餘元件全被固定住，版面永遠縮不下去（看起來像自動重排壞掉）。
+
+        拆分頁一併移除：原檔只有一張貼圖，「還原原始」就是回到一張。
         """
         for placement in self.placements:
             placement.set_scale(1.0)
             placement.pos = (placement.src_rect[0], placement.src_rect[1])
             placement.pinned = False
+            placement.page = 0
+        self.extra_pages = []
         self.canvas = self.src_canvas
 
     def by_rect(self) -> dict[Rect, Placement]:
@@ -241,11 +346,13 @@ class SheetLayout:
             placement.set_scale(scale)
 
     def area_ratio(self) -> float:
-        """新畫布面積 / 原畫布面積（<1 代表變小）"""
+        """所有輸出頁面積合計 / 原畫布面積（<1 代表變小）"""
         src = self.src_canvas[0] * self.src_canvas[1]
         if src <= 0 or not self.is_packed:
             return 1.0
-        return (self.canvas[0] * self.canvas[1]) / src
+        total = self.canvas[0] * self.canvas[1]
+        total += sum(p.canvas[0] * p.canvas[1] for p in self.extra_pages)
+        return total / src
 
     def fingerprint(self) -> tuple:
         """影響輸出內容的所有欄位（預覽／估算快取用）"""
@@ -254,8 +361,9 @@ class SheetLayout:
             self.canvas,
             self.padding,
             self.align,
+            tuple((p.name, p.canvas) for p in self.extra_pages),
             tuple(
-                (p.src_rect, round(p.scale, 6), p.pos)
+                (p.src_rect, round(p.scale, 6), p.pos, p.page)
                 for p in sorted(self.placements, key=lambda p: p.src_rect)
             ),
         )
@@ -268,9 +376,11 @@ class SheetLayout:
             )
         scale = self.uniform_scale
         scale_text = f"{scale * 100:g}%" if scale is not None else "各區塊不同比例"
+        split_text = f"、拆 {self.page_count} 頁" if self.extra_pages else ""
         return (
             f"{self.src_canvas[0]}x{self.src_canvas[1]} → "
-            f"{self.canvas[0]}x{self.canvas[1]}（{len(self.placements)} 個元件、{scale_text}）"
+            f"{self.canvas[0]}x{self.canvas[1]}"
+            f"（{len(self.placements)} 個元件、{scale_text}{split_text}）"
         )
 
     # ------------------------------------------------------------ 序列化
@@ -282,6 +392,7 @@ class SheetLayout:
             "canvas": list(self.canvas),
             "padding": self.padding,
             "align": self.align,
+            "extra_pages": [p.to_dict() for p in self.extra_pages],
             "placements": [p.to_dict() for p in self.placements],
         }
 
@@ -302,11 +413,20 @@ class SheetLayout:
             )
         except (TypeError, ValueError, IndexError):
             return None
+        for raw in data.get("extra_pages", []):
+            if not isinstance(raw, dict):
+                continue
+            page = SheetPage.from_dict(raw)
+            if page is not None:
+                layout.extra_pages.append(page)
         for raw in data.get("placements", []):
             if not isinstance(raw, dict):
                 continue
             placement = Placement.from_dict(raw)
             if placement is not None:
+                # 頁索引超出範圍（檔案被改壞）就收回主頁，至少不會弄丟元件
+                if placement.page >= layout.page_count:
+                    placement.page = 0
                 layout.placements.append(placement)
         if layout.is_identity:
             # 舊版「還原原始版面」會把恆等版面的元件全部固定；恆等版面

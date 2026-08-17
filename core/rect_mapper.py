@@ -44,7 +44,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from models.atlas_data import AtlasPage, AtlasRegion
+from models.atlas_data import AtlasFile, AtlasPage, AtlasProp, AtlasRegion
 
 
 def round_half_up(value: float) -> int:
@@ -304,36 +304,79 @@ def _offset_drift(
     return drift[0], drift[1]
 
 
-def build_layout_mapping(page: AtlasPage, layout) -> tuple[PageMapping, list[str]]:
+def apply_layout(
+    atlas: AtlasFile, page: AtlasPage, layout
+) -> tuple[list[tuple[int, PageMapping]], list[str]]:
     """
-    依合圖版面建立對照表（每個區塊各自的比例與位置都由版面決定）。
+    把（可能拆分成多頁的）合圖版面套進這份 atlas。
 
-    版面是「整張貼圖」的屬性，一次算好套用到所有共用它的 atlas，
-    所以三份 atlas 拿到的座標一定一致。
+    * 區塊依版面的頁指派分組：留在主頁（page 0）的不動，其餘**搬到新建的
+      拆分頁**——props 複製自原頁、插在原頁之後。沒分到任何區塊的拆分頁
+      不建立：每份 atlas 只列出自己用到的頁（共用貼圖時各 atlas 只認得
+      自己那部分的區塊，這是正常情況，不是錯誤）。
+    * Spine 的 attachment 只以「區塊名稱」對應 atlas，區塊搬到哪一頁都
+      不影響 .skel，所以拆頁不會破圖。
+    * 回傳 ``[(版面頁索引, 對照表)]`` 與找不到對應元件的區塊名稱。
+      對照表**尚未**套用座標——呼叫端驗證後逐一 ``apply_page_mapping``
+      （拆分頁的尺寸也由它寫入）。
 
     Args:
-        page: 要重算的 atlas 頁面
+        atlas: 這份 atlas（拆分頁會插進它的 pages）
+        page: 要套用版面的頁面
         layout: ``models.sheet_layout.SheetLayout``
-
-    Returns:
-        (對照表, 找不到對應元件的區塊名稱)——後者代表版面與 atlas 不同步。
     """
     placements = layout.by_rect()
-    mapping = PageMapping(
-        page=page,
-        src_size=page.size,
-        dst_canvas=layout.canvas,
-        scale_x=0.0,   # 版面模式沒有單一比例；漂移統計以各區塊自己的比例計算
-        scale_y=0.0,
-    )
+    grouped: dict[int, list[tuple[AtlasRegion, object]]] = {}
     unmatched: list[str] = []
     for region in page.regions:
         placement = placements.get(region.page_rect)
         if placement is None or placement.pos is None:
             unmatched.append(region.name)
             continue
-        mapping.regions.append(map_region_to_rect(region, placement.dst_rect))
-    return mapping, unmatched
+        grouped.setdefault(placement.page, []).append((region, placement))
+    if unmatched:
+        return [], unmatched
+
+    def make_mapping(target: AtlasPage, canvas: tuple[int, int], index: int) -> PageMapping:
+        mapping = PageMapping(
+            page=target,
+            src_size=page.size,
+            dst_canvas=canvas,
+            scale_x=0.0,   # 版面模式沒有單一比例；漂移統計以各區塊自己的比例計算
+            scale_y=0.0,
+        )
+        mapping.regions = [
+            map_region_to_rect(region, placement.dst_rect)  # type: ignore[attr-defined]
+            for region, placement in grouped.get(index, [])
+        ]
+        return mapping
+
+    results: list[tuple[int, PageMapping]] = [(0, make_mapping(page, layout.canvas, 0))]
+
+    moved_ids: set[int] = set()
+    insert_at = atlas.pages.index(page) + 1
+    for index in range(1, layout.page_count):
+        entries = grouped.get(index)
+        if not entries:
+            continue
+        split = AtlasPage(
+            name=layout.page_name(index),
+            props=[
+                AtlasProp(p.key, list(p.values), p.indent, p.sep, p.delim)
+                for p in page.props
+            ],
+            leading_blank=True,
+        )
+        for region, _placement in entries:
+            split.regions.append(region)
+            moved_ids.add(id(region))
+        atlas.pages.insert(insert_at, split)
+        insert_at += 1
+        results.append((index, make_mapping(split, layout.page_canvas(index), index)))
+
+    if moved_ids:
+        page.regions = [r for r in page.regions if id(r) not in moved_ids]
+    return results, []
 
 
 def build_page_mapping(

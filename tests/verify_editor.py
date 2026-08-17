@@ -14,7 +14,8 @@
 6. 排版後沒有元件重疊
 7. 只點開來看不算「自訂」——沒動過就不會被套用
 8. 「還原原始版面」真的回到原檔：atlas byte-identical、貼圖像素不變
-9. 點一下選取**不會**把元件固定；改比例會**取消固定**並排到最小
+9. 搬移「放開就不固定」：拖曳過程跟著滑鼠，放開後元件不留固定狀態；
+   壓到別的元件會被自動排開（見 18）；改比例會取消固定並排到最小
 10. 拖曳「進行中」右側的尺寸就要跟著更新，不是放開才跳一次
 11. 100% 時排版**永不變大**：初始就是原始版面（面積 0% 變化），
     按「重新排版」或從其他比例調回 100% 也不會比原檔大——
@@ -29,6 +30,12 @@
     處理完回編輯器不再拿舊座標裁新貼圖（跑版）；同步前開編輯器要警告
 16. 「還原原始版面」不固定元件——還原後再調整任何散圖，自動重排要能
     把版面縮下去（以前全被固定，調了也縮不動，像自動重排壞掉）
+17. 拆分合圖：新增頁（預設名 XXXX_2、空白時與原圖同尺寸）、跨頁拖曳搬移
+    （多選一起搬、不固定、丟入後自動縮排、可復原）、套用時空頁自動捨棄；
+    輸出多張貼圖與多頁 atlas，共用同一張圖的兩份 atlas 拆分結果一致，
+    拆分頁的像素與原圖對應區塊完全相同
+18. **元件不可重疊（最嚴重的規定）**：把元件放到別人身上，放開時剛放下的
+    保住位置、被壓到的自動排開；任何操作結束後整份版面零重疊
 
 第 1 ~ 3 點是為了鎖住一個修過的 bug：縮放比例原本以「當下的選取範圍」為基準，
 元件變大會讓基準跟著變大 → 比例變小 → 元件縮回去，滑鼠沒動也會在兩個尺寸
@@ -50,8 +57,11 @@ from PyQt6.QtWidgets import QApplication
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core.atlas_parser import parse_atlas_file
 from core.pipeline import BatchResult, process_asset, refresh_overwritten_sources
 from core.project_file import load_project_file, save_project_file
+from core.sheet_group import overlapping_placements
+from models.sheet_layout import SheetLayout
 from core.project_scanner import scan_projects
 from core.sheet_group import build_sheet_groups
 from models.process_options import ProcessOptions
@@ -301,7 +311,7 @@ def main() -> int:
         same_px = px_after.shape == px_before.shape and np.array_equal(px_after, px_before)
         check(same_px, f"貼圖像素完全相同（{px_before.shape[1]}x{px_before.shape[0]}）")
 
-        print("\n[9] 點選不會固定元件；改比例會取消固定並排到最小")
+        print("\n[9] 搬移放開不固定；改比例會取消固定並排到最小")
         pins = SheetEditorDialog(groups=groups, layouts=LayoutStore(), default_scale=1.0)
         pins.resize(1100, 700)
         pins.show()
@@ -321,7 +331,7 @@ def main() -> int:
         pinned = sum(1 for p in pin_layout.placements if p.pinned)
         check(pinned == 0, f"點過 4 個元件後被固定的數量 = {pinned}")
 
-        # 真的拖曳才會固定
+        # 真的拖曳：放開後也不固定，壓到的鄰居會被自動排開
         moved = pin_layout.placements[0]
         x, y, w, h = moved.dst_rect
         spot = pin_canvas._to_view(x + w / 2, y + h / 2).toPoint()
@@ -329,7 +339,8 @@ def main() -> int:
         move(pin_canvas, spot + QPoint(30, 20))
         release(pin_canvas, spot + QPoint(30, 20))
         app.processEvents()
-        check(moved.pinned, "真的拖曳後才被固定")
+        check(not moved.pinned, "拖曳放開後不固定")
+        check(not overlapping_placements(pin_layout), "壓到的鄰居已自動排開（零重疊）")
 
         # 全選改比例：固定要被自動取消（位置是在舊比例下挑的），
         # 畫布才縮得到接近理論最小——「還原原始版面」後整張都被固定，
@@ -469,6 +480,8 @@ def main() -> int:
             editor3.canvas.select([layout_a.placements[1]])
             editor3.canvas.nudge(3, 2)
             app.processEvents()
+            # 介面已不再產生固定狀態；直接標一個，驗證舊專案檔的固定照樣存讀
+            layout_a.placements[1].pinned = True
             editor3.padding_spin.setValue(5)
             app.processEvents()
 
@@ -558,11 +571,11 @@ def main() -> int:
         undo_dlg.canvas.select([second])
         undo_dlg.canvas.nudge(5, 3)
         app.processEvents()
-        check(second.pos != pos_before and second.pinned, "微調後位置改變且被固定")
+        check(second.pos != pos_before and not second.pinned,
+              "微調後位置改變（放開不固定）")
         undo_dlg._undo()
         app.processEvents()
-        check(second.pos == pos_before and not second.pinned,
-              "Ctrl+Z 連位置與固定狀態一起還原")
+        check(second.pos == pos_before, "Ctrl+Z 還原微調位置")
 
         undo_dlg.canvas.select_all()
         undo_dlg.item_spin.setValue(50.0)
@@ -666,6 +679,182 @@ def main() -> int:
             f"（面積 {area / src_area * 100:.0f}%）",
         )
         rv.close()
+
+        print("\n[17] 拆分合圖：新增頁、跨頁搬移、輸出多張貼圖")
+        work5 = Path(tempfile.mkdtemp(prefix="jreditor5_"))
+        try:
+            build_sheet(work5)
+            # 第二份 atlas 共用同一張貼圖：拆分結果必須兩份一致
+            (work5 / "sheet_b.atlas").write_text(
+                (work5 / "sheet.atlas").read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            projects5 = scan_projects([work5])
+            groups5 = build_sheet_groups(projects5)
+            check(
+                len(groups5) == 1 and len(groups5[0].atlas_names) == 2,
+                f"兩份 atlas 共用一張合圖 -> {len(groups5)} 組、{len(groups5[0].atlas_names)} 份",
+            )
+            with Image.open(groups5[0].page_path) as handle:
+                src_px5 = np.asarray(handle.convert("RGBA")).copy()
+
+            store5 = LayoutStore()
+            editor5 = SheetEditorDialog(groups=groups5, layouts=store5, default_scale=1.0)
+            editor5.resize(1100, 700)
+            editor5.show()
+            app.processEvents()
+            layout5 = editor5.canvas.layout
+            assert layout5 is not None
+
+            editor5._add_page()
+            app.processEvents()
+            check(
+                layout5.page_count == 2 and layout5.page_name(1) == "sheet_2.png",
+                f"新增頁預設名 -> {layout5.page_name(1)}",
+            )
+            check(layout5.page_canvas(1) == layout5.src_canvas, "空白頁先與原圖同尺寸")
+
+            # 多選 4 個元件，一起拖進新頁（模擬真實滑鼠拖放）
+            picked5 = layout5.placements[:4]
+            editor5.canvas.select(picked5)
+            app.processEvents()
+            fx, fy, fw, fh = picked5[0].dst_rect
+            start5 = editor5.canvas._to_view(fx + fw / 2, fy + fh / 2).toPoint()
+            page1_origin = editor5.canvas._page_origin(1)
+            target5 = editor5.canvas._to_view(
+                page1_origin[0] + 40, page1_origin[1] + 40
+            ).toPoint()
+            press(editor5.canvas, start5)
+            move(editor5.canvas, target5)
+            release(editor5.canvas, target5)
+            app.processEvents()
+            check({p.page for p in picked5} == {1}, "多選 4 個一起拖進新頁")
+            check(all(not p.pinned for p in picked5), "跨頁搬移不固定，自動重排接手")
+            page1_canvas = layout5.page_canvas(1)
+            check(
+                layout5.is_packed and page1_canvas != layout5.src_canvas,
+                f"丟入元件後新頁自動縮排 -> {page1_canvas}",
+            )
+
+            editor5._undo()
+            app.processEvents()
+            check(
+                all(p.page == 0 for p in picked5)
+                and layout5.page_canvas(1) == layout5.src_canvas,
+                "Ctrl+Z 退回搬移前（新頁回到空白原尺寸）",
+            )
+            editor5._redo()
+            app.processEvents()
+            check({p.page for p in picked5} == {1}, "Ctrl+Y 重做搬移")
+
+            # 再加一頁但不放東西：套用時要自動捨棄
+            editor5._add_page()
+            app.processEvents()
+            check(layout5.page_count == 3, "再新增一頁（保持空白）")
+            editor5._on_accept()
+            check(layout5.page_count == 2, "套用時空白頁自動捨棄")
+            committed5, _ = editor5.result_layouts()
+            editor5.close()
+            check(len(committed5) == 1, "拆分版面要套用")
+            round5 = SheetLayout.from_dict(committed5[0].to_dict())
+            check(
+                round5 is not None and round5.to_dict() == committed5[0].to_dict(),
+                "拆分版面序列化 round-trip 逐欄位相同",
+            )
+
+            for item in committed5:
+                store5.put(item)
+            batch5 = BatchResult()
+            rendered5: dict = {}
+            for project in projects5:
+                for asset in project.atlases:
+                    if not asset.is_loadable or asset.missing_pages:
+                        continue
+                    batch5.results.append(process_asset(
+                        asset, ProcessOptions(), rendered_pages=rendered5, layouts=store5
+                    ))
+            check(
+                len(batch5.results) == 2 and all(r.ok for r in batch5.results),
+                f"兩份共用 atlas 都處理成功（{len(batch5.results)} 份）",
+            )
+            check((work5 / "sheet_2.png").is_file(), "輸出拆分頁 sheet_2.png")
+
+            def region_map(parsed):
+                return {
+                    r.name: (r.xy, r.size, page.name)
+                    for page in parsed.pages for r in page.regions
+                }
+
+            parsed_maps = []
+            final = committed5[0]
+            for atlas_name in ("sheet.atlas", "sheet_b.atlas"):
+                parsed = parse_atlas_file(work5 / atlas_name)
+                names = [p.name for p in parsed.pages]
+                check(
+                    names == ["sheet.png", "sheet_2.png"],
+                    f"{atlas_name} 的頁面 -> {names}",
+                )
+                check(
+                    parsed.pages[0].size == final.canvas
+                    and parsed.pages[1].size == final.page_canvas(1),
+                    f"{atlas_name} 頁面尺寸 -> {parsed.pages[0].size} / {parsed.pages[1].size}",
+                )
+                check(
+                    parsed.region_count == 12 and len(parsed.pages[1].regions) == 4,
+                    f"{atlas_name} 區塊分佈 -> 共 {parsed.region_count}、"
+                    f"拆分頁 {len(parsed.pages[1].regions)} 個",
+                )
+                parsed_maps.append(region_map(parsed))
+            check(parsed_maps[0] == parsed_maps[1], "兩份共用 atlas 的拆分結果一致")
+
+            with Image.open(work5 / "sheet_2.png") as handle:
+                split_px = np.asarray(handle.convert("RGBA"))
+            moved0 = next(p for p in final.placements if p.page == 1)
+            sx, sy, sw, sh = moved0.src_rect
+            dx, dy = moved0.pos
+            check(
+                np.array_equal(split_px[dy:dy + sh, dx:dx + sw],
+                               src_px5[sy:sy + sh, sx:sx + sw]),
+                "拆分頁像素與原圖對應區塊完全相同",
+            )
+
+            # 覆蓋輸出後的記憶體同步也要認得新頁
+            refresh_overwritten_sources(batch5, store5)
+            asset5 = next(a for p in projects5 for a in p.atlases if a.is_loadable)
+            check(
+                "sheet_2.png" in asset5.pages and asset5.pages["sheet_2.png"] is not None,
+                "同步後 asset 認得拆分頁（不會被當成缺圖）",
+            )
+            check(len(store5) == 0, "已消耗的拆分版面移除")
+        finally:
+            shutil.rmtree(work5, ignore_errors=True)
+
+        print("\n[18] 元件不可重疊：放到別人身上會自動排開")
+        ov = SheetEditorDialog(groups=groups, layouts=LayoutStore(), default_scale=1.0)
+        ov.resize(1100, 700)
+        ov.show()
+        app.processEvents()
+        o_layout = ov.canvas.layout
+        assert o_layout is not None
+        a18, b18 = o_layout.placements[0], o_layout.placements[1]
+        bx, by, bw, bh = b18.dst_rect
+        target_centre = (bx + bw / 2, by + bh / 2)
+
+        ov.canvas.select([a18])
+        ax, ay, aw, ah = a18.dst_rect
+        start18 = ov.canvas._to_view(ax + aw / 2, ay + ah / 2).toPoint()
+        end18 = ov.canvas._to_view(*target_centre).toPoint()
+        press(ov.canvas, start18)
+        move(ov.canvas, end18)
+        release(ov.canvas, end18)
+        app.processEvents()
+        check(not overlapping_placements(o_layout), "放開後整份版面零重疊")
+        adx, ady, adw, adh = a18.dst_rect
+        check(
+            adx <= target_centre[0] <= adx + adw and ady <= target_centre[1] <= ady + adh,
+            f"剛放下的元件保住位置（蓋住目標點）-> pos {a18.pos}",
+        )
+        check(not a18.pinned and not b18.pinned, "沒有任何元件被固定")
+        ov.close()
 
         print("\n全部通過" if not failed else f"\n失敗 {failed} 項")
         return 1 if failed else 0

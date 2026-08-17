@@ -55,13 +55,17 @@ def render_sheet(
     layout,
     settings: RenderSettings,
     premultiplied: bool = False,
+    page_index: int = 0,
 ) -> RenderResult:
     """
-    依合圖版面重繪整張合圖（元件各自的比例與新位置都來自版面）。
+    依合圖版面重繪一張輸出頁（元件各自的比例與新位置都來自版面）。
 
     這裡刻意走**版面的元件聯集**而不是某一份 atlas 的區塊清單：一張合圖被
     三份 atlas 共用時，每份 atlas 只認得自己那部分的區塊，若照著其中一份畫，
     另外兩份需要的像素就不會出現在輸出的圖裡。
+
+    版面拆分成多頁時，``page_index`` 指定要畫哪一頁——每頁都是同一張
+    來源貼圖的元件子集合，畫布尺寸取該頁自己的。
 
     Args:
         layout: ``models.sheet_layout.SheetLayout``
@@ -69,9 +73,11 @@ def render_sheet(
     return _render(
         source=source,
         blits=[
-            (p.src_rect, p.dst_rect) for p in layout.placements if p.pos is not None
+            (p.src_rect, p.dst_rect)
+            for p in layout.placements
+            if p.pos is not None and p.page == page_index
         ],
-        canvas_size=layout.canvas,
+        canvas_size=layout.page_canvas(page_index),
         premultiplied=premultiplied,
         settings=settings,
     )

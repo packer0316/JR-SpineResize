@@ -42,8 +42,20 @@ from PyQt6.QtWidgets import (
 )
 
 from config.constants import PAGE_ALIGN_4, PAGE_ALIGN_NONE, PAGE_ALIGN_POT
-from core.sheet_group import DEFAULT_PADDING, SheetGroup, repack
-from models.sheet_layout import MAX_REGION_SCALE, MIN_REGION_SCALE, LayoutStore, Placement, SheetLayout
+from core.sheet_group import (
+    DEFAULT_PADDING,
+    SheetGroup,
+    overlapping_placements,
+    repack,
+    resolve_overlaps,
+)
+from models.sheet_layout import (
+    MAX_REGION_SCALE,
+    MIN_REGION_SCALE,
+    LayoutStore,
+    SheetLayout,
+    SheetPage,
+)
 from ui.components.sheet_canvas import SheetCanvas
 from ui.styles.theme import DELTA_DOWN_COLOUR, DELTA_UP_COLOUR
 from utils.file_utils import format_bytes
@@ -132,7 +144,8 @@ class SheetEditorDialog(QDialog):
 
         header = QLabel(
             "以合圖為單位重新排版：元件可拖曳角落等比縮放，版面會自動縮到最小尺寸，"
-            "atlas 座標同步更新。<br>"
+            "atlas 座標同步更新；「新增合圖頁」可把一張合圖<b>拆成多張輸出</b>，"
+            "元件拖到哪一頁就輸出到哪張圖。<br>"
             "<b>共用同一張合圖的所有 atlas 會一起套用同一份版面</b>——"
             "這樣才不會有一份改了、另一份沒改而輸出壞掉。"
             "清單可 Ctrl／Shift／Ctrl+A 多選，一次重排或還原多張。"
@@ -252,8 +265,9 @@ class SheetEditorDialog(QDialog):
         box.addWidget(self.canvas, 1)
 
         hint = QLabel(
-            "拖曳角落＝等比縮放（可多選一起縮，改比例會取消固定）　"
-            "拖曳元件＝搬移並固定位置　空白處拉框＝多選　Ctrl+A＝全選　"
+            "拖曳角落＝等比縮放（可多選一起縮）　"
+            "拖曳元件＝搬移（放開不固定；壓到別的元件會自動排開，元件不可重疊）　"
+            "拖到另一頁＝搬到那張圖　空白處拉框＝多選　Ctrl+A＝全選　"
             "Ctrl+Z＝復原　Ctrl+Y＝重做　方向鍵＝微調　滾輪＝縮放檢視"
         )
         hint.setProperty("role", "hint")
@@ -289,9 +303,21 @@ class SheetEditorDialog(QDialog):
         box = QVBoxLayout(group)
         box.setSpacing(6)
 
+        self.add_page_button = QPushButton("新增合圖頁（拆圖）")
+        self.add_page_button.setToolTip(
+            "把一張合圖拆成多張輸出：新增一頁後把元件拖過去即可\n"
+            "（例如特效一張、材質一張）。共用這張合圖的每一份 atlas\n"
+            "都會拿到同樣的拆分結果，.skel 完全不用改。\n"
+            "空白頁先跟原圖一樣大，丟入元件後才會自動縮排；\n"
+            "套用時仍然空白的頁會自動捨棄。"
+        )
+        self.add_page_button.clicked.connect(self._add_page)
+        box.addWidget(self.add_page_button)
+
         self.revert_button = QPushButton("還原原始版面")
         self.revert_button.setToolTip(
-            "回到來源 atlas 原本的樣子：比例 100%、位置與頁面尺寸都照原檔\n"
+            "回到來源 atlas 原本的樣子：比例 100%、位置與頁面尺寸都照原檔，\n"
+            "拆分出去的頁也會併回主頁\n"
             "輸出的 atlas 會與原檔 byte-identical，貼圖像素也維持原樣\n"
             "（等於「這張合圖不要動」——全域的縮放比例對它不生效，\n"
             "壓縮設定仍然生效）\n"
@@ -558,7 +584,7 @@ class SheetEditorDialog(QDialog):
         for widget in (
             self.padding_spin, self.align_combo, self.auto_check,
             self.unpin_button, self.select_all_button, self.unpin_all_button,
-            self.names_check,
+            self.names_check, self.add_page_button,
         ):
             widget.setEnabled(single)
 
@@ -600,8 +626,9 @@ class SheetEditorDialog(QDialog):
         if layout is None:
             self.canvas_title.setText("")
             return
+        pages = f"　＋{len(layout.extra_pages)} 頁" if layout.extra_pages else ""
         self.canvas_title.setText(
-            f"{layout.canvas[0]} x {layout.canvas[1]}　"
+            f"{layout.canvas[0]} x {layout.canvas[1]}{pages}　"
             f"檢視 {self.canvas.view_scale * 100:.0f}%"
         )
 
@@ -614,6 +641,49 @@ class SheetEditorDialog(QDialog):
     def _mark_group_touched(self, group: SheetGroup) -> None:
         self._touched.add(group.key)
         self._refresh_row(group)
+
+    # ------------------------------------------------------------ 拆分頁
+
+    def _add_page(self) -> None:
+        """
+        新增一個空白拆分頁（預設名字 XXXX_2、XXXX_3…）。
+
+        空白頁先跟原圖一樣大，讓使用者有地方把元件拖進去；丟入第一個元件
+        之後自動重排才開始把它縮到最小。套用時仍然空白的頁會自動捨棄，
+        所以誤按新增不需要任何「刪除頁」的操作。
+        """
+        group = self._current
+        if group is None:
+            return
+        layout = self._ensure_layout(group)
+        self._push_undo()
+        layout.add_page(self._next_page_name(group, layout))
+        self._mark_touched()
+        self.canvas.fit_to_view()   # 版面變寬，重新置中才看得到新頁
+        self._sync_stats()
+
+    def _next_page_name(self, group: SheetGroup, layout: SheetLayout) -> str:
+        """
+        預設頁名：<原檔名>_2、_3…（沿用原副檔名）。
+
+        不能與版面現有頁、清單上其他合圖、或磁碟上既有檔案撞名——
+        輸出寫進同一個資料夾，撞名等於覆蓋別人的檔案。
+        """
+        stem = group.page_path.stem
+        suffix = group.page_path.suffix or ".png"
+        taken = {layout.page_name(i).lower() for i in range(layout.page_count)}
+        taken.update(g.page_path.name.lower() for g in self._groups)
+        for other in self._working.values():
+            taken.update(p.name.lower() for p in other.extra_pages)
+        number = 2
+        while True:
+            candidate = f"{stem}_{number}{suffix}"
+            if (
+                candidate.lower() not in taken
+                and not (group.page_path.parent / candidate).exists()
+            ):
+                return candidate
+            number += 1
 
     # ------------------------------------------------------------ 復原（Ctrl+Z）
 
@@ -722,12 +792,29 @@ class SheetEditorDialog(QDialog):
         self._sync_selection_panel()
 
     def _on_canvas_edited(self, resized: bool) -> None:
-        """畫布上拖曳完成：只重排，檢視維持原樣（免得畫面跟著跳）"""
+        """
+        畫布上拖曳完成：改了尺寸（或跨頁搬移）就重排；純搬移只把壓到的排開。
+
+        元件不可重疊是最嚴重的規定——搬移放開時若壓到別的元件，
+        剛放下的保住位置、被壓到的自動讓開，任何情況都不留下重疊。
+        檢視維持原樣（免得畫面跟著跳）。
+        """
         self._mark_touched()
         if resized:
             self._repack(refit=False)
         else:
+            layout = self.canvas.layout
+            moved = (
+                resolve_overlaps(layout, keep=self.canvas.selected())
+                if layout is not None else []
+            )
+            if moved:
+                self.canvas.update()
             self._sync_stats()
+            if moved and not self.warn_label.text():
+                self.warn_label.setText(
+                    f"已自動排開 {len(moved)} 個被壓到的元件（元件不可重疊）"
+                )
         self._sync_selection_panel()
 
     def _on_pack_option(self) -> None:
@@ -845,6 +932,9 @@ class SheetEditorDialog(QDialog):
                 self.warn_label.setText(
                     f"{len(overflow)} 個元件排不進頁面上限，請縮小比例"
                 )
+        else:
+            # 關閉自動重排也絕不允許重疊：把被壓到的排開（保住剛調整的）
+            resolve_overlaps(layout, keep=self.canvas.selected())
         if layout.canvas != before and (refit or not self.canvas.canvas_fits()):
             # refit=False 時只有「畫布長大到看不完整」才被動重新置中，
             # 免得改個元件就看不到自己在改哪裡
@@ -905,7 +995,13 @@ class SheetEditorDialog(QDialog):
         src_w, src_h = layout.src_canvas
         new_w, new_h = layout.canvas
         ratio = layout.area_ratio()
-        fill = layout.used_area / (new_w * new_h) * 100 if new_w and new_h else 0.0
+        # 填充率以「有元件的頁」合計：空白的新頁還沒開始用，不該拉低數字
+        used_pages_area = sum(
+            layout.page_canvas(i)[0] * layout.page_canvas(i)[1]
+            for i in range(layout.page_count)
+            if layout.placements_on(i)
+        )
+        fill = layout.used_area / used_pages_area * 100 if used_pages_area else 0.0
         if layout.is_identity:
             # 恆等版面：講清楚它同時也是「不吃全域比例」的意思，
             # 否則使用者會以為右側設定的 50% 還是會生效。
@@ -921,13 +1017,20 @@ class SheetEditorDialog(QDialog):
             arrow = "↓" if ratio <= 1.0 else "↑"
             pinned = sum(1 for p in layout.placements if p.pinned)
             pin_text = f"　固定 {pinned} 個" if pinned else ""
+            size_text = f"{src_w}x{src_h} → {new_w}x{new_h}"
+            if layout.extra_pages:
+                extras = "、".join(
+                    f"{page.name} {page.canvas[0]}x{page.canvas[1]}"
+                    for page in layout.extra_pages
+                )
+                size_text += f"<br>＋ {extras}"
             self.canvas_label.setText(
-                f"{src_w}x{src_h} → {new_w}x{new_h}<br>"
+                f"{size_text}<br>"
                 f"<span style='color:{colour}'>面積 {arrow}{abs(1 - ratio) * 100:.0f}%</span>"
                 f"　填充 {fill:.0f}%{pin_text}"
             )
 
-        overlaps = _overlapping(layout)
+        overlaps = overlapping_placements(layout)
         self.canvas.set_overlapping(overlaps)
         messages = []
         mismatch = (
@@ -940,9 +1043,10 @@ class SheetEditorDialog(QDialog):
                 "畫面內容不可信，請重新載入專案再編輯"
             )
         if overlaps:
+            # 正常操作後不可能出現（任何路徑都會自動排開）；留著當保險
             messages.append(
-                f"{len(overlaps)} 個元件互相重疊（多半是固定位置後又改了大小）——"
-                "按「重新排版」或「取消固定」修正，重疊的版面不能套用"
+                f"{len(overlaps)} 個元件互相重疊——按「重新排版」修正，"
+                "重疊的版面不能套用"
             )
         tiny = [p for p in layout.placements if min(p.dst_size) <= 2]
         if tiny:
@@ -968,15 +1072,27 @@ class SheetEditorDialog(QDialog):
 
     def _on_accept(self) -> None:
         bad: list[str] = []
+        pruned = False
         for key in self._touched:
             layout = self._working.get(key)
             if layout is None:
                 continue
-            if not layout.is_packed:
+            # 空白的拆分頁直接捨棄（輸出只是一張全透明貼圖，沒有意義）
+            if layout.prune_empty_pages():
+                pruned = True
+            if not layout.placements_on(0):
+                bad.append(
+                    f"{_name_of(layout)}：主頁沒有任何元件"
+                    "（至少留一個，或按「還原原始版面」）"
+                )
+            elif not layout.is_packed:
                 bad.append(f"{_name_of(layout)}：尚未排版")
-            elif _overlapping(layout):
+            elif overlapping_placements(layout):
                 bad.append(f"{_name_of(layout)}：有元件重疊")
         if bad:
+            if pruned:
+                self.canvas.update()
+                self._sync_stats()
             QMessageBox.warning(
                 self, "合圖群組編輯器",
                 "以下合圖還不能套用：\n\n" + "\n".join(bad[:6]),
@@ -1003,51 +1119,30 @@ class SheetEditorDialog(QDialog):
 
 def _snapshot(layout: SheetLayout) -> tuple:
     """
-    版面的復原快照：畫布、間距、對齊與每個元件的（比例、位置、固定）。
+    版面的復原快照：畫布、間距、對齊、拆分頁清單與每個元件的
+    （比例、位置、固定、所在頁）。
 
     元件清單在編輯期間只會改屬性、不會增減（增減只發生在開啟時的
-    sync_layout），所以用索引對回去就夠了。
+    sync_layout），所以用索引對回去就夠了；拆分頁會增減，整份記下來。
     """
     return (
         layout.canvas,
         layout.padding,
         layout.align,
-        tuple((p.scale, p.pos, p.pinned) for p in layout.placements),
+        tuple((p.name, p.canvas) for p in layout.extra_pages),
+        tuple((p.scale, p.pos, p.pinned, p.page) for p in layout.placements),
     )
 
 
 def _apply_snapshot(layout: SheetLayout, snap: tuple) -> None:
     layout.canvas, layout.padding, layout.align = snap[0], snap[1], snap[2]
-    for placement, (scale, pos, pinned) in zip(layout.placements, snap[3]):
+    layout.extra_pages = [SheetPage(name=name, canvas=canvas) for name, canvas in snap[3]]
+    for placement, (scale, pos, pinned, page) in zip(layout.placements, snap[4]):
         placement.scale = scale
         placement.pos = pos
         placement.pinned = pinned
+        placement.page = page
 
 
 def _name_of(layout: SheetLayout) -> str:
     return layout.page_path.name
-
-
-def _overlapping(layout: SheetLayout) -> list[Placement]:
-    """
-    找出互相重疊的元件。
-
-    完全相同的矩形是合法的（打包器去重讓多個名稱共用同一塊像素），
-    這裡只抓「部分重疊」——那才會讓 UV 取到別張圖。
-    """
-    placed = [p for p in layout.placements if p.pos is not None]
-    bad: set[int] = set()
-    result: list[Placement] = []
-    for index, first in enumerate(placed):
-        ax, ay, aw, ah = first.dst_rect
-        for second in placed[index + 1:]:
-            bx, by, bw, bh = second.dst_rect
-            if (ax, ay, aw, ah) == (bx, by, bw, bh):
-                continue
-            if bx >= ax + aw or bx + bw <= ax or by >= ay + ah or by + bh <= ay:
-                continue
-            for placement in (first, second):
-                if id(placement) not in bad:
-                    bad.add(id(placement))
-                    result.append(placement)
-    return result

@@ -34,8 +34,8 @@ from core.exceptions import AtlasParseError, PageImageError, ProcessError
 from core.page_renderer import RenderSettings, render_page, render_sheet
 from core.rect_mapper import (
     align_up,
+    apply_layout,
     apply_page_mapping,
-    build_layout_mapping,
     build_page_mapping,
     round_half_up,
 )
@@ -189,7 +189,13 @@ def refresh_overwritten_sources(
             try:
                 result.asset.atlas = parse_atlas_file(result.asset.atlas_path)
             except AtlasParseError:
-                pass  # 解析失敗就先留舊資料，重新載入時自然會更新
+                continue  # 解析失敗就先留舊資料，重新載入時自然會更新
+            # 拆分版面會產生新的頁面（XXXX_2.png），頁名 -> 路徑的對照要重建，
+            # 否則新頁會被當成「缺少貼圖」而擋下後續處理
+            result.asset.pages = {
+                p.name: resolve_page(result.asset.folder, p.name)
+                for p in result.asset.atlas.pages
+            }
     return overwritten
 
 
@@ -388,13 +394,15 @@ def process_asset(
     pending_writes: list[tuple[Path, bytes | Path]] = []
     fresh_pages: dict[Path, RenderedPage] = {}
 
-    for page in atlas.pages:
+    # 走快照：拆分版面會在處理途中把新頁插進 atlas.pages，
+    # 直接迭代原清單會把剛拆出來的頁當成「來源頁」再處理一次
+    for page in list(atlas.pages):
         src_path = asset.pages[page.name]
         assert src_path is not None
         notify(f"{asset.name} → {page.name}")
 
         try:
-            page_output = _process_page(
+            page_outputs = _process_page(
                 page=page,
                 src_path=src_path,
                 out_dir=out_dir,
@@ -412,8 +420,7 @@ def process_asset(
             result.report.add(LEVEL_ERROR, f"[{page.name}] {exc}")
             result.error = str(exc)
             break
-        if page_output is not None:
-            result.pages.append(page_output)
+        result.pages.extend(page_outputs)
 
     if result.error:
         result.elapsed = time.perf_counter() - started
@@ -463,11 +470,16 @@ def _process_page(
     fresh_pages: dict[Path, RenderedPage],
     owner: str,
     layout: SheetLayout | None = None,
-) -> PageOutput | None:
-    """處理單一頁面：算出縮放比例、產生新貼圖、把座標寫回 atlas。"""
+) -> list[PageOutput]:
+    """
+    處理單一來源頁面：算出縮放比例、產生新貼圖、把座標寫回 atlas。
+
+    合圖版面可以把一張來源拆成多個輸出頁（特效一張、材質一張），
+    所以回傳的是**輸出清單**——沒拆頁時就只有一筆；驗證失敗回傳空清單
+    （錯誤已寫進 report）。
+    """
     declared = page.size
-    dst_name = _output_name(page.name, options.filename_suffix)
-    dst_path = out_dir / dst_name
+    dst_path = out_dir / _output_name(page.name, options.filename_suffix)
 
     if options.mode == MODE_RESCALE:
         if layout is not None and not layout.is_packed:
@@ -475,15 +487,14 @@ def _process_page(
                 LEVEL_ERROR,
                 f"[{page.name}] 合圖版面尚未排版完成，請在合圖編輯器裡重新排版",
             )
-            return None
+            return []
 
         if layout is not None:
             # 版面模式沒有單一比例，用 0 讓「絕不變大保護」失效（像素一定變了）。
             # 例外是「原始版面」：輸出與原檔逐像素相同，這時就該比照 100% 處理，
             # 壓縮沒收益時直接沿用原檔。
             scale = 1.0 if layout.is_identity else 0.0
-            canvas = layout.canvas
-            mapping, unmatched = build_layout_mapping(page, layout)
+            mapped, unmatched = apply_layout(atlas, page, layout)
             if unmatched:
                 shown = "、".join(unmatched[:5]) + (" …" if len(unmatched) > 5 else "")
                 report.add(
@@ -491,118 +502,136 @@ def _process_page(
                     f"[{page.name}] 合圖版面與 atlas 不同步，"
                     f"{len(unmatched)} 個區塊找不到對應元件：{shown}",
                 )
-                return None
+                return []
+            jobs = [
+                (index, mapping, out_dir / _output_name(mapping.page.name, options.filename_suffix))
+                for index, mapping in mapped
+            ]
         else:
             scale = options.scale
             canvas = (
                 max(1, align_up(round_half_up(declared[0] * scale), options.page_align)),
                 max(1, align_up(round_half_up(declared[1] * scale), options.page_align)),
             )
-            mapping = build_page_mapping(page, scale, scale, canvas)
+            jobs = [(0, build_page_mapping(page, scale, scale, canvas), dst_path)]
 
-        # 先看這張貼圖本批次是不是已經產生過（多個 atlas 共用一張圖）。
-        # 這個判斷必須在讀圖之前：覆蓋模式下來源已被我們改成縮好的圖，
-        # 若先去檢查「宣告尺寸 vs 實際尺寸」一定會誤判成二次縮放而失敗。
-        record = rendered_pages.get(dst_path.resolve())
-        if record is not None:
-            blocker = _reuse_blocker(record, src_path, canvas, mapping, layout)
-            if blocker:
-                report.add(LEVEL_ERROR, f"[{page.name}] {blocker}")
-                return None
-            report.add(
-                LEVEL_INFO,
-                f"[{page.name}] 與 {record.owner} 共用同一張貼圖，沿用本批次已產生的結果",
+        outputs: list[PageOutput] = []
+        source: Image.Image | None = None
+        source_mode = ""
+        src_bytes = 0
+
+        for page_index, mapping, job_dst in jobs:
+            canvas = mapping.dst_canvas
+            # 先看這張貼圖本批次是不是已經產生過（多個 atlas 共用一張圖）。
+            # 這個判斷必須在讀圖之前：覆蓋模式下來源已被我們改成縮好的圖，
+            # 若先去檢查「宣告尺寸 vs 實際尺寸」一定會誤判成二次縮放而失敗。
+            record = rendered_pages.get(job_dst.resolve())
+            if record is not None:
+                blocker = _reuse_blocker(record, src_path, canvas, mapping, layout)
+                if blocker:
+                    report.add(LEVEL_ERROR, f"[{page.name}] {blocker}")
+                    return []
+                report.add(
+                    LEVEL_INFO,
+                    f"[{mapping.page.name}] 與 {record.owner} 共用同一張貼圖，"
+                    "沿用本批次已產生的結果",
+                )
+                report.extend(validate_page(mapping, canvas))
+                apply_page_mapping(mapping)
+                outputs.append(PageOutput(
+                    page_name=mapping.page.name,
+                    src_path=src_path,
+                    dst_path=job_dst,
+                    src_size=declared,
+                    dst_size=canvas,
+                    src_bytes=record.src_bytes,
+                    dst_bytes=record.dst_bytes,
+                    reused=True,
+                    source_mode=record.source_mode,
+                    encoding="共用（已產生）",
+                ))
+                continue
+
+            if source is None:
+                try:
+                    with Image.open(src_path) as image_file:
+                        actual = image_file.size
+                        source_mode = image_file.mode
+                        image_file.load()
+                        source = image_file.convert("RGBA")
+                except OSError as exc:
+                    raise PageImageError(f"無法讀取貼圖 {src_path.name}：{exc}") from exc
+
+                # 宣告尺寸與實際圖檔不一致，多半代表貼圖已經被縮過一次；
+                # 這時再縮一次就會二次劣化，直接擋下來。
+                source_check = validate_source_page(page.name, declared, actual)
+                if not source_check.ok:
+                    report.extend(source_check)
+                    return []
+                src_bytes = src_path.stat().st_size
+
+            if layout is not None and layout.is_identity:
+                # 原始版面＝這張合圖不要動：連重繪都跳過，直接拿來源像素去壓縮。
+                # 走重繪路徑的話邊緣滲出會改到透明區的 RGB，就不是「原封不動」了。
+                image = source
+                report.add(
+                    LEVEL_INFO,
+                    f"[{page.name}] 使用原始版面，貼圖像素與 atlas 座標維持原樣（只做壓縮）",
+                )
+            elif layout is not None:
+                # 版面模式畫的是「版面上這一頁的所有元件」，不是這一份 atlas 的
+                # 區塊清單——共用這張合圖的其他 atlas 需要的像素也必須在圖裡
+                render = render_sheet(
+                    source, layout, settings, page.is_premultiplied, page_index=page_index
+                )
+                image = render.image
+                for note in render.notes:
+                    report.add(LEVEL_INFO, f"[{mapping.page.name}] {note}")
+            else:
+                render = render_page(source, mapping, settings)
+                image = render.image
+                for note in render.notes:
+                    report.add(LEVEL_INFO, f"[{page.name}] {note}")
+
+            payload, encoding, dst_bytes = _encode_texture(
+                image,
+                job_dst,
+                src_path,
+                scale,
+                options.compression,
             )
+            pending_writes.append((job_dst, payload))
+            # 只先記在本份資產的暫存表；等驗證通過、檔案真的寫出去了才併進批次共用表，
+            # 否則後面共用同一張圖的 atlas 會沿用一個根本沒被寫出的結果。
+            # 來源容量只記在主頁上：拆分頁與主頁同一個來源檔，重複記會多算一次
+            fresh_pages[job_dst.resolve()] = RenderedPage(
+                src_path=src_path.resolve(),
+                canvas=canvas,
+                region_keys=_region_keys(mapping),
+                src_bytes=src_bytes if page_index == 0 else 0,
+                dst_bytes=dst_bytes,
+                source_mode=source_mode,
+                encoding=encoding,
+                owner=owner,
+                layout_fingerprint=layout.fingerprint() if layout is not None else None,
+            )
+
             report.extend(validate_page(mapping, canvas))
             apply_page_mapping(mapping)
-            return PageOutput(
-                page_name=page.name,
+
+            outputs.append(PageOutput(
+                page_name=mapping.page.name if layout is not None else page.name,
                 src_path=src_path,
-                dst_path=dst_path,
+                dst_path=job_dst,
                 src_size=declared,
                 dst_size=canvas,
-                src_bytes=record.src_bytes,
-                dst_bytes=record.dst_bytes,
-                reused=True,
-                source_mode=record.source_mode,
-                encoding="共用（已產生）",
-            )
-
-        try:
-            with Image.open(src_path) as image:
-                actual = image.size
-                source_mode = image.mode
-                image.load()
-                source = image.convert("RGBA")
-        except OSError as exc:
-            raise PageImageError(f"無法讀取貼圖 {src_path.name}：{exc}") from exc
-
-        # 宣告尺寸與實際圖檔不一致，多半代表貼圖已經被縮過一次；
-        # 這時再縮一次就會二次劣化，直接擋下來。
-        source_check = validate_source_page(page.name, declared, actual)
-        if not source_check.ok:
-            report.extend(source_check)
-            return None
-
-        src_bytes = src_path.stat().st_size
-        if layout is not None and layout.is_identity:
-            # 原始版面＝這張合圖不要動：連重繪都跳過，直接拿來源像素去壓縮。
-            # 走重繪路徑的話邊緣滲出會改到透明區的 RGB，就不是「原封不動」了。
-            image = source
-            report.add(
-                LEVEL_INFO,
-                f"[{page.name}] 使用原始版面，貼圖像素與 atlas 座標維持原樣（只做壓縮）",
-            )
-        elif layout is not None:
-            # 版面模式畫的是「版面上的所有元件」，不是這一份 atlas 的區塊清單——
-            # 共用這張合圖的其他 atlas 需要的像素也必須在圖裡
-            render = render_sheet(source, layout, settings, page.is_premultiplied)
-            image = render.image
-            for note in render.notes:
-                report.add(LEVEL_INFO, f"[{page.name}] {note}")
-        else:
-            render = render_page(source, mapping, settings)
-            image = render.image
-            for note in render.notes:
-                report.add(LEVEL_INFO, f"[{page.name}] {note}")
-
-        payload, encoding, dst_bytes = _encode_texture(
-            image,
-            dst_path,
-            src_path,
-            scale,
-            options.compression,
-        )
-        pending_writes.append((dst_path, payload))
-        # 只先記在本份資產的暫存表；等驗證通過、檔案真的寫出去了才併進批次共用表，
-        # 否則後面共用同一張圖的 atlas 會沿用一個根本沒被寫出的結果
-        fresh_pages[dst_path.resolve()] = RenderedPage(
-            src_path=src_path.resolve(),
-            canvas=canvas,
-            region_keys=_region_keys(mapping),
-            src_bytes=src_bytes,
-            dst_bytes=dst_bytes,
-            source_mode=source_mode,
-            encoding=encoding,
-            owner=owner,
-            layout_fingerprint=layout.fingerprint() if layout is not None else None,
-        )
-
-        report.extend(validate_page(mapping, canvas))
-        apply_page_mapping(mapping)
-
-        return PageOutput(
-            page_name=page.name,
-            src_path=src_path,
-            dst_path=dst_path,
-            src_size=declared,
-            dst_size=canvas,
-            src_bytes=src_bytes,
-            dst_bytes=dst_bytes,
-            reused=False,
-            source_mode=source_mode,
-            encoding=encoding,
-        )
+                src_bytes=src_bytes if page_index == 0 else 0,
+                dst_bytes=dst_bytes,
+                reused=False,
+                source_mode=source_mode,
+                encoding=encoding,
+            ))
+        return outputs
 
     # ---------------------------------------------------------------- 只重算 atlas
     if layout is not None:
@@ -648,7 +677,7 @@ def _process_page(
     if scaled_path.resolve() != dst_path.resolve():
         pending_writes.append((dst_path, scaled_path))
 
-    return PageOutput(
+    return [PageOutput(
         page_name=page.name,
         src_path=scaled_path,
         dst_path=dst_path,
@@ -656,7 +685,7 @@ def _process_page(
         dst_size=actual,
         src_bytes=src_path.stat().st_size if src_path.exists() else 0,
         dst_bytes=scaled_path.stat().st_size,
-    )
+    )]
 
 
 def _find_prescaled_page(page_name: str, fallback: Path, options: ProcessOptions) -> Path | None:
@@ -698,7 +727,7 @@ def build_preview(
     """
     估算處理後的貼圖大小，必要時一併產生預覽貼圖。
 
-    走與正式輸出完全相同的路徑（build_page_mapping / build_layout_mapping →
+    走與正式輸出完全相同的路徑（build_page_mapping / apply_layout →
     render → compress_texture），只是壓縮用快速模式（oxipng level 1）加速，
     所以數字與畫面都忠於實際輸出。
 
@@ -731,7 +760,8 @@ def build_preview(
         wants_pages = asset is preview_asset
         atlas = parse_atlas_file(asset.atlas_path)
 
-        for page in atlas.pages:
+        # 走快照：拆分版面會把新頁插進 atlas.pages（理由同 process_asset）
+        for page in list(atlas.pages):
             src_path = asset.pages.get(page.name)
             if src_path is None:
                 continue
@@ -745,20 +775,30 @@ def build_preview(
 
             layout = layouts.get(src_path) if layouts is not None else None
             if layout is not None and layout.is_packed:
-                canvas = layout.canvas
-                mapping, unmatched = build_layout_mapping(page, layout)
+                mapped, unmatched = apply_layout(atlas, page, layout)
                 if unmatched:
                     raise ProcessError(
                         f"{page.name} 的合圖版面與 atlas 不同步"
                         f"（{len(unmatched)} 個區塊找不到對應元件）"
                     )
-                # 與 _process_page 一致：原始版面不重繪，直接用來源像素
-                rendered = source if layout.is_identity else render_sheet(
-                    source, layout, settings, page.is_premultiplied
-                ).image
                 # 版面模式像素一定變了，不套用「絕不變大」保護；
                 # 「原始版面」除外（輸出與原檔逐像素相同）
                 page_scale = 1.0 if layout.is_identity else 0.0
+                canvas = layout.canvas
+                est_raw = 0
+                for page_index, mapping in mapped:
+                    # 與 _process_page 一致：原始版面不重繪，直接用來源像素
+                    rendered = source if layout.is_identity else render_sheet(
+                        source, layout, settings, page.is_premultiplied,
+                        page_index=page_index,
+                    ).image
+                    preview_img, data, _ = compress_texture(
+                        rendered, src_path.suffix, options.compression, fast=True
+                    )
+                    apply_page_mapping(mapping)
+                    if wants_pages:
+                        build.pages[mapping.page.name] = preview_img.convert("RGBA")
+                    est_raw += len(data)  # 拆分頁的容量一起算（同一個來源檔）
             else:
                 canvas = (
                     max(1, align_up(round_half_up(declared[0] * scale), options.page_align)),
@@ -767,13 +807,13 @@ def build_preview(
                 mapping = build_page_mapping(page, scale, scale, canvas)
                 rendered = render_page(source, mapping, settings).image
                 page_scale = scale
-
-            preview_img, data, _ = compress_texture(
-                rendered, src_path.suffix, options.compression, fast=True
-            )
-            apply_page_mapping(mapping)
-            if wants_pages:
-                build.pages[page.name] = preview_img.convert("RGBA")
+                preview_img, data, _ = compress_texture(
+                    rendered, src_path.suffix, options.compression, fast=True
+                )
+                apply_page_mapping(mapping)
+                if wants_pages:
+                    build.pages[page.name] = preview_img.convert("RGBA")
+                est_raw = len(data)
 
             key = src_path.resolve()
             if key in seen_sources:
@@ -781,7 +821,7 @@ def build_preview(
             seen_sources.add(key)
 
             src_bytes = src_path.stat().st_size if src_path.exists() else 0
-            est_bytes = len(data)
+            est_bytes = est_raw
             # 與 _encode_texture 的「絕不變大保護」一致
             if page_scale == 1.0 and not options.compression.alters_pixels and src_bytes:
                 est_bytes = min(est_bytes, src_bytes)

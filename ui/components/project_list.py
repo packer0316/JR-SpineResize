@@ -44,8 +44,9 @@ class ProjectList(QTableWidget):
         self._criteria = FilterCriteria()
         # 貼圖 -> 用到它的專案數（判斷共用；以全部專案計算，不受篩選影響）
         self._page_users: dict[str, int] = {}
-        # 有自訂合圖版面的貼圖（由主視窗同步進來，只用於清單標示）
-        self._custom_layouts: set[str] = set()
+        # 有自訂合圖版面的貼圖 -> 版面的輸出畫布尺寸（由主視窗同步進來；
+        # 合圖欄用鍵標示「✎」，頁面尺寸欄用值顯示套用後的實際大小）
+        self._custom_layouts: dict[str, tuple[int, int]] = {}
         # id(project) -> 共用群編號；群編號 -> 顏色（依顯示順序輪替，相鄰群不同色）
         self._clusters: dict[int, int] = {}
         self._group_colours: dict[int, str] = {}
@@ -100,11 +101,16 @@ class ProjectList(QTableWidget):
         self._criteria = criteria
         self._rebuild(select_first=False)
 
-    def set_custom_layouts(self, keys: set[str]) -> None:
-        """更新「哪些貼圖有自訂合圖版面」（合圖欄會標示出來）"""
-        if keys == self._custom_layouts:
+    def set_custom_layouts(self, layouts: dict[str, tuple[int, int]]) -> None:
+        """
+        更新「哪些貼圖有自訂合圖版面」與它們的輸出尺寸。
+
+        合圖欄標示「✎」，頁面尺寸欄改顯示版面的畫布尺寸——在合圖編輯器
+        按下「套用版面」後，清單上的尺寸就是實際會輸出的大小。
+        """
+        if layouts == self._custom_layouts:
             return
-        self._custom_layouts = set(keys)
+        self._custom_layouts = dict(layouts)
         self.refresh_all()
 
     def set_theme(self, theme_key: str) -> None:
@@ -210,7 +216,7 @@ class ProjectList(QTableWidget):
         self.setItem(row, 0, name_item)
         self.setItem(row, 1, QTableWidgetItem(project.spine_version or "—"))
         self.setItem(row, _COL_SHEET, self._sheet_item(project))
-        self.setItem(row, 3, QTableWidgetItem(project.page_size_text() or "—"))
+        self.setItem(row, 3, self._page_size_item(project))
         self.setItem(row, 4, QTableWidgetItem(str(project.region_count) if project.region_count else "—"))
         size = project.source_bytes
         self.setItem(row, 5, QTableWidgetItem(format_bytes(size) if size else "—"))
@@ -220,6 +226,30 @@ class ProjectList(QTableWidget):
             status.setToolTip("\n".join(project.warnings))
         self.setItem(row, 6, status)
         self.setItem(row, _COL_DELTA, self._delta_item(project))
+
+    def _page_size_item(self, project: SpineProject) -> QTableWidgetItem:
+        """
+        頁面尺寸欄：有自訂版面的頁面顯示版面的輸出尺寸（套用後的實際大小），
+        其餘顯示 atlas 宣告的原始尺寸。
+        """
+        parts: list[str] = []
+        notes: list[str] = []
+        for asset in project.atlases:
+            if not asset.atlas:
+                continue
+            for page in asset.atlas.pages:
+                declared = f"{page.size[0]}x{page.size[1]}"
+                path = asset.pages.get(page.name)
+                canvas = self._custom_layouts.get(layout_key(path)) if path else None
+                if canvas and canvas[0] > 0 and tuple(canvas) != tuple(page.size):
+                    parts.append(f"{canvas[0]}x{canvas[1]}")
+                    notes.append(f"{page.name}：{declared} → {canvas[0]}x{canvas[1]}（自訂版面）")
+                else:
+                    parts.append(declared)
+        item = QTableWidgetItem(" / ".join(parts) if parts else "—")
+        if notes:
+            item.setToolTip("\n".join(notes))
+        return item
 
     def _sheet_item(self, project: SpineProject) -> QTableWidgetItem:
         """

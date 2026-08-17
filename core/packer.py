@@ -4,20 +4,31 @@
 每個元件各自縮放後，原本的版面就會留下一堆縫隙，所以要重新排一次並把頁面
 縮到「裝得下的最小尺寸」。
 
-作法：MaxRects + BSSF（Best Short Side Fit）——與 Spine 打包器、
-libgdx TexturePacker 同一族的演算法，實作簡單而且填充率高。
+作法：MaxRects（與 Spine 打包器、libgdx TexturePacker 同一族），但不只跑一種
+策略——裝箱是 NP-hard，單一啟發式在某些素材上就是會吃虧，所以每個候選寬度
+會用多組「放置順序 × 挑位規則」各排一次，取面積最小的：
 
-最小尺寸的求法不是解析解（裝箱是 NP-hard），而是**掃寬度**：
+* 放置順序：面積、最長邊、高、寬、周長（都由大到小）
+* 挑位規則：BSSF（短邊剩最少）與 BAF（剩餘面積最小），同分時偏好靠上靠左
 
-1. 以總面積開根號估一個起點，往兩邊列出一串候選寬度
-2. 每個候選寬度都排一次，高度不設限，排完取實際用到的高度
-3. 取面積最小的那一組（同面積時偏好比較接近正方形的）
+最小尺寸的求法是**掃寬度**：
 
-候選寬度會依對齊設定產生（2 的次方時只試 2 的次方），所以「補到 POT」
-不是排完再補，而是直接在 POT 的框裡找最小的一組，不會白白浪費空間。
+1. 候選寬度＝等距掃描 ＋ 幾個「一定要試」的點：總面積開根號（接近正方形）、
+   原頁面寬度、2 的次方、以及「最寬的前 k 個元件並排」的寬度
+   （規則排列的素材最佳解常剛好落在 k 欄的寬度上，等距掃會跳過）
+2. 每個寬度排一次（高度不設限），先用預設策略粗掃
+3. 在表現最好的幾個寬度上把所有策略組合都跑過，再細掃冠軍寬度附近
+4. 取面積最小的一組（同面積時偏好接近正方形的）
+
+候選寬度依對齊設定產生（2 的次方時只試 2 的次方），所以「補到 POT」不是
+排完再補，而是直接在 POT 的框裡找最小的一組，不會白白浪費空間。
 
 元件之間會保留間距（padding），這是等比縮小後**必須**補回來的：原本 2px
 的間距縮一半只剩 1px，擋不住 GPU Linear 取樣跨過邊界吃到隔壁的圖塊。
+
+> 「永不比原版面差」的保證不在這裡，在 ``sheet_group.repack``：它會把
+> 「原始版面等比縮小」也當成一個候選，與這裡的結果比面積取小——
+> 100% 時該候選就是原版面本身，所以排版結果保證不會比原檔大。
 """
 from __future__ import annotations
 
@@ -33,6 +44,17 @@ Rect = tuple[int, int, int, int]
 # 記憶體對齊、肉眼檢查都是），所以先在這個比例內找最小面積，
 # 真的只有極端長條的內容才會退回不設限的解。
 MAX_ASPECT = 4.0
+
+# 放置順序（sort key，都由大到小排）。單一順序在某些形狀分佈上就是會吃虧：
+# 高瘦元件多時「高優先」贏，寬扁元件多時「寬優先」贏，混合時「面積」通常最穩。
+_ORDERS = (
+    lambda i: (i.width * i.height, max(i.width, i.height)),   # 面積
+    lambda i: (max(i.width, i.height), i.width * i.height),   # 最長邊
+    lambda i: (i.height, i.width),                            # 高
+    lambda i: (i.width, i.height),                            # 寬
+    lambda i: (i.width + i.height, i.width * i.height),       # 周長
+)
+_RULES = ("bssf", "baf")
 
 
 @dataclass
@@ -59,12 +81,15 @@ class PackResult:
 
 @dataclass
 class _Best:
-    """搜尋過程中的候選畫布"""
+    """搜尋過程中的候選畫布（記下策略組合，細掃階段沿用）"""
 
     area: int
     squareness: int
     canvas: tuple[int, int]
     positions: dict[int, tuple[int, int]]
+    order: int = 0
+    rule: str = "bssf"
+    width: int = 0
 
     @property
     def score(self) -> tuple[int, int]:
@@ -101,21 +126,31 @@ class _MaxRects:
         self._split_all(rect)
         self.used.append(rect)
 
-    def insert(self, width: int, height: int) -> tuple[int, int] | None:
-        """BSSF：挑「較短邊剩餘最少」的空位，同分時比較長邊"""
-        best: tuple[int, int, int, int] | None = None  # (short, long, x, y)
+    def insert(self, width: int, height: int, rule: str = "bssf") -> tuple[int, int] | None:
+        """
+        挑一個空位放進去。
+
+        * ``bssf``：較短邊剩餘最少（貼合最緊的空位）
+        * ``baf``：剩餘面積最小（優先塞滿小洞）
+
+        同分時偏好靠上、再靠左——讓內容往左上角聚，右下的大片空間留給後面的
+        元件，也讓結果可重現。
+        """
+        best: tuple[tuple, int, int] | None = None
         for fx, fy, fw, fh in self.free:
             if fw < width or fh < height:
                 continue
             leftover_x = fw - width
             leftover_y = fh - height
-            short = min(leftover_x, leftover_y)
-            long_ = max(leftover_x, leftover_y)
-            if best is None or (short, long_) < (best[0], best[1]):
-                best = (short, long_, fx, fy)
+            if rule == "baf":
+                score = (fw * fh - width * height, min(leftover_x, leftover_y), fy, fx)
+            else:
+                score = (min(leftover_x, leftover_y), max(leftover_x, leftover_y), fy, fx)
+            if best is None or score < best[0]:
+                best = (score, fx, fy)
         if best is None:
             return None
-        x, y = best[2], best[3]
+        x, y = best[1], best[2]
         rect = (x, y, width, height)
         self._split_all(rect)
         self.used.append(rect)
@@ -190,7 +225,13 @@ def _merge(kept: list[Rect], fresh: list[Rect]) -> list[Rect]:
 # ---------------------------------------------------------------- 單次排版
 
 
-def _pack_at(items: list[PackItem], width: int, padding: int) -> tuple[dict[int, tuple[int, int]], int, list[PackItem]]:
+def _pack_at(
+    items: list[PackItem],
+    width: int,
+    padding: int,
+    order: int = 0,
+    rule: str = "bssf",
+) -> tuple[dict[int, tuple[int, int]], int, list[PackItem]]:
     """
     在指定寬度下排一次（高度不設限）。
 
@@ -210,14 +251,8 @@ def _pack_at(items: list[PackItem], width: int, padding: int) -> tuple[dict[int,
         bin_.occupy((x, y, item.width + padding, item.height + padding))
         positions[id(item)] = (x, y)
 
-    # 大的先放（面積 → 最長邊），這是 MaxRects 填充率的關鍵
-    order = sorted(
-        movable,
-        key=lambda i: (i.width * i.height, max(i.width, i.height)),
-        reverse=True,
-    )
-    for item in order:
-        placed = bin_.insert(item.width + padding, item.height + padding)
+    for item in sorted(movable, key=_ORDERS[order], reverse=True):
+        placed = bin_.insert(item.width + padding, item.height + padding, rule)
         if placed is None:
             overflow.append(item)
             continue
@@ -283,20 +318,28 @@ def pack(
         canvas = fixed_canvas or (1, 1)
         return PackResult(canvas=canvas, positions={}, overflow=[])
 
+    # 元件很多時把放置順序減到兩種，互動才不會頓；元件少時全開拚品質
+    order_count = len(_ORDERS) if len(items) <= 150 else 2
+
     if fixed_canvas is not None:
         width, height = fixed_canvas
-        positions, _, overflow = _pack_at(items, width, padding)
-        # 高度不設限地排完才知道有沒有超出指定畫布
-        too_tall = [
-            item for item in items
-            if id(item) in positions
-            and positions[id(item)][1] + item.height > height
-        ]
-        return PackResult(
-            canvas=fixed_canvas,
-            positions=positions,
-            overflow=overflow + too_tall,
-        )
+        fallback: tuple[dict[int, tuple[int, int]], list[PackItem]] | None = None
+        for order in range(order_count):
+            for rule in _RULES:
+                positions, _, overflow = _pack_at(items, width, padding, order, rule)
+                # 高度不設限地排完才知道有沒有超出指定畫布
+                too_tall = [
+                    item for item in items
+                    if id(item) in positions
+                    and positions[id(item)][1] + item.height > height
+                ]
+                bad = overflow + too_tall
+                if not bad:
+                    return PackResult(canvas=fixed_canvas, positions=positions, overflow=[])
+                if fallback is None or len(bad) < len(fallback[1]):
+                    fallback = (positions, bad)
+        assert fallback is not None
+        return PackResult(canvas=fixed_canvas, positions=fallback[0], overflow=fallback[1])
 
     widest = max(i.width + padding for i in items)
     area = sum((i.width + padding) * (i.height + padding) for i in items)
@@ -310,10 +353,16 @@ def pack(
     # 兩個最佳解：長寬比合理的（優先採用）與不設限的（保底）
     best: _Best | None = None
     best_any: _Best | None = None
+    width_scores: dict[int, tuple[int, int]] = {}
+    tried: set[tuple[int, int, str]] = set()
 
-    def consider(width: int) -> None:
+    def consider(width: int, order: int, rule: str) -> None:
         nonlocal best, best_any
-        positions, content_h, overflow = _pack_at(items, width, padding)
+        key = (width, order, rule)
+        if key in tried or width < low or width > MAX_PAGE_SIZE:
+            return
+        tried.add(key)
+        positions, content_h, overflow = _pack_at(items, width, padding, order, rule)
         if overflow:
             return
         content_w = max(
@@ -329,39 +378,68 @@ def pack(
             squareness=abs(canvas_w - canvas_h),
             canvas=(canvas_w, canvas_h),
             positions=positions,
+            order=order,
+            rule=rule,
+            width=width,
         )
+        recorded = width_scores.get(width)
+        if recorded is None or candidate.score < recorded:
+            width_scores[width] = candidate.score
         if best_any is None or candidate.score < best_any.score:
             best_any = candidate
         if candidate.aspect <= MAX_ASPECT and (best is None or candidate.score < best.score):
             best = candidate
 
-    if align <= 0:  # 2 的次方：候選本來就只有幾個，全試
+    if align <= 0:  # 2 的次方：候選本來就只有幾個，全部策略都試
         for width in _pot_widths(low):
-            consider(width)
+            for order in range(order_count):
+                for rule in _RULES:
+                    consider(width, order, rule)
     else:
-        # 粗掃一輪找到大概的最佳寬度，再在它附近細掃——比等距掃 50 個點
-        # 快三倍以上，結果幾乎一樣（裝箱的面積對寬度是相當平滑的曲線）
         step = max(1, align)
         limit = min(MAX_PAGE_SIZE, max(low, root * 2))
-        # 等距掃很容易剛好跳過「正方形」那一點：規則排列的內容常有好幾個
-        # 面積完全相同的解（例如 16x4 塊與 8x8 塊），漏掉正方形那個就會
-        # 得到 2048x512 這種同面積但難用的結果。所以把幾個「一定要試」的
-        # 寬度直接加進來：面積開根號、2 的次方、以及原頁面寬度。
-        specials = [root, *_pot_widths(low)[:4]]
+
+        # 候選寬度：等距掃 + 幾個「一定要試」的點。等距掃很容易剛好跳過最佳解
+        # （規則排列的素材最佳解常落在 k 欄寬度或正方形那一點上），所以把
+        # 面積開根號、原頁面寬度、2 的次方、k 欄寬度都直接加進候選。
+        candidates = set(_sweep(low, limit, step, 12))
+        specials: list[int] = [root, *_pot_widths(low)[:3]]
         if hint_width:
-            specials.append(hint_width)
-        candidates = _sweep(low, limit, step, 12)
-        candidates.extend(
-            align_up(w, step) for w in specials if low <= w <= limit
+            specials.append(min(hint_width, MAX_PAGE_SIZE))
+        running = 0
+        for item_w in sorted((i.width + padding for i in items), reverse=True)[:12]:
+            running += item_w
+            if running > limit:
+                break
+            specials.append(running)  # 最寬的前 k 個並排的寬度
+        candidates.update(
+            align_up(w, step) for w in specials if low <= w <= MAX_PAGE_SIZE
         )
-        for width in sorted(set(candidates)):
-            consider(width)
-        chosen = best or best_any
-        if chosen is not None:
-            centre = chosen.canvas[0]
+
+        # 粗掃：預設策略掃過所有候選寬度
+        for width in sorted(candidates):
+            consider(width, 0, "bssf")
+
+        # 深掘：在表現最好的幾個寬度上，把所有「順序 × 規則」組合都跑過
+        ranked = sorted(width_scores.items(), key=lambda kv: kv[1])[:2]
+        retry = {width for width, _ in ranked}
+        first = best or best_any
+        if first is not None:
+            retry.add(first.width)
+        for width in sorted(retry):
+            for order in range(order_count):
+                for rule in _RULES:
+                    consider(width, order, rule)
+
+        # 細掃冠軍寬度附近（沿用它的策略組合，外加預設組合）
+        leader = best or best_any
+        if leader is not None:
             span = max(step, (limit - low) // 12)
-            for width in _sweep(max(low, centre - span), min(limit, centre + span), step, 6):
-                consider(width)
+            for width in _sweep(
+                max(low, leader.width - span), min(limit, leader.width + span), step, 6
+            ):
+                consider(width, leader.order, leader.rule)
+                consider(width, 0, "bssf")
 
     winner = best or best_any
     if winner is None:

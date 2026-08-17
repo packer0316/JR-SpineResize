@@ -14,7 +14,13 @@
 6. 排版後沒有元件重疊
 7. 只點開來看不算「自訂」——沒動過就不會被套用
 8. 「還原原始版面」真的回到原檔：atlas byte-identical、貼圖像素不變
-9. 點一下選取**不會**把元件固定；改整組比例會取消固定並排到最小
+9. 點一下選取**不會**把元件固定；「取消全部固定並重排」會排到最小
+10. 拖曳「進行中」右側的尺寸就要跟著更新，不是放開才跳一次
+11. 100% 時排版**永不變大**：初始就是原始版面（面積 0% 變化），
+    按「重新排版」或從其他比例調回 100% 也不會比原檔大——
+    「原始版面等比縮小」永遠是排版的候選之一，比啟發式差就不採用
+12. 清單可多選合圖：「重新排版」與「還原原始版面」一次套用到全部選取，
+    其他控制項停用、畫布唯讀
 
 第 1 ~ 3 點是為了鎖住一個修過的 bug：縮放比例原本以「當下的選取範圍」為基準，
 元件變大會讓基準跟著變大 → 比例變小 → 元件縮回去，滑鼠沒動也會在兩個尺寸
@@ -48,10 +54,10 @@ PAGE_W = COLS * (BLOCK + GAP) + GAP
 PAGE_H = ROWS * (BLOCK + GAP) + GAP
 
 
-def build_sheet(folder: Path) -> None:
+def build_sheet(folder: Path, name: str = "sheet") -> None:
     """造一張 12 個色塊的合圖（未裁切，方便看出等比是否被破壞）"""
     image = Image.new("RGBA", (PAGE_W, PAGE_H), (0, 0, 0, 0))
-    lines = ["", "sheet.png", f"size: {PAGE_W},{PAGE_H}",
+    lines = ["", f"{name}.png", f"size: {PAGE_W},{PAGE_H}",
              "format: RGBA8888", "filter: Linear,Linear", "repeat: none"]
     for index in range(COLS * ROWS):
         col, row = index % COLS, index // COLS
@@ -60,8 +66,8 @@ def build_sheet(folder: Path) -> None:
         lines += [f"block_{index}", "  rotate: false", f"  xy: {x}, {y}",
                   f"  size: {BLOCK}, {BLOCK}", f"  orig: {BLOCK}, {BLOCK}",
                   "  offset: 0, 0", "  index: -1"]
-    image.save(folder / "sheet.png")
-    (folder / "sheet.atlas").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    image.save(folder / f"{name}.png")
+    (folder / f"{name}.atlas").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # ------------------------------------------------------------ 假滑鼠事件
@@ -217,7 +223,9 @@ def main() -> int:
 
         print("\n[6] 排版後沒有元件重疊")
         dialog.auto_check.setChecked(True)
-        dialog.group_spin.setValue(50.0)
+        dialog._unpin_all()                 # 之前拖過的元件會被固定，先解掉
+        canvas.select_all()
+        dialog.item_spin.setValue(50.0)     # 全選 + 比例 = 整組縮放
         app.processEvents()
         after = canvas.layout
         check(after.is_packed, f"重排完成 -> {after.canvas}")
@@ -250,9 +258,10 @@ def main() -> int:
         editor = SheetEditorDialog(groups=groups, layouts=LayoutStore(), default_scale=0.5)
         editor.show()
         app.processEvents()
-        editor.group_spin.setValue(40.0)       # 先亂改
+        editor.canvas.select_all()
+        editor.item_spin.setValue(40.0)        # 先亂改
         app.processEvents()
-        editor._revert_layout()                # 再還原
+        editor._revert_selected()              # 再還原
         app.processEvents()
         reverted = editor.canvas.layout
         check(reverted.is_identity and reverted.canvas == reverted.src_canvas,
@@ -283,7 +292,7 @@ def main() -> int:
         same_px = px_after.shape == px_before.shape and np.array_equal(px_after, px_before)
         check(same_px, f"貼圖像素完全相同（{px_before.shape[1]}x{px_before.shape[0]}）")
 
-        print("\n[9] 點選不會固定元件；改整組比例會排到最小")
+        print("\n[9] 點選不會固定元件；取消全部固定並重排會排到最小")
         pins = SheetEditorDialog(groups=groups, layouts=LayoutStore(), default_scale=1.0)
         pins.resize(1100, 700)
         pins.show()
@@ -313,15 +322,122 @@ def main() -> int:
         app.processEvents()
         check(moved.pinned, "真的拖曳後才被固定")
 
-        # 改整組比例：固定要被取消，畫布要縮到接近理論最小
-        pins.group_spin.setValue(17.0)
+        # 全選改比例後按「取消全部固定並重排」：固定要被取消，畫布縮到接近理論最小
+        pin_canvas.select_all()
+        pins.item_spin.setValue(17.0)
+        app.processEvents()
+        pins._unpin_all()
         app.processEvents()
         small = pin_canvas.layout
         pinned_after = sum(1 for p in small.placements if p.pinned)
         fill = small.used_area / (small.canvas[0] * small.canvas[1]) * 100
         check(pinned_after == 0 and fill >= 55,
-              f"整組 17% -> {small.canvas}、填充 {fill:.0f}%、固定 {pinned_after} 個")
+              f"17% + 取消固定並重排 -> {small.canvas}、填充 {fill:.0f}%、固定 {pinned_after} 個")
         pins.close()
+
+        print("\n[10] 拖曳中右側讀數就要跟著動")
+        live = SheetEditorDialog(groups=groups, layouts=LayoutStore(), default_scale=1.0)
+        live.resize(1100, 700)
+        live.show()
+        app.processEvents()
+        live.auto_check.setChecked(False)
+        live_canvas = live.canvas
+        target = live_canvas.layout.placements[0]
+        live_canvas.select([target])
+        app.processEvents()
+
+        start = bottom_right(live_canvas, target)
+        press(live_canvas, start)
+        readouts = []
+        for step in range(1, 5):
+            move(live_canvas, start + QPoint(step * 12, step * 12))
+            app.processEvents()
+            # 面板顯示的尺寸必須等於元件當下的真實尺寸（放開之前就要對）
+            width, height = target.dst_size
+            readouts.append((
+                f"{width}x{height}" in live.selection_label.text().replace("<b>", "").replace("</b>", ""),
+                round(live.item_spin.value(), 1) == round(target.scale * 100, 1),
+                f"{width}x{height}",
+            ))
+        release(live_canvas, start + QPoint(48, 48))
+        sizes = [r[2] for r in readouts]
+        check(all(r[0] for r in readouts), f"拖曳中尺寸讀數同步 -> {sizes}")
+        check(all(r[1] for r in readouts), "拖曳中比例讀數同步")
+        check(len(set(sizes)) == len(sizes), f"每一步的讀數都不同（真的有在更新）-> {sizes}")
+        live.close()
+
+        print("\n[11] 100% 排版永不變大")
+        base = SheetEditorDialog(groups=groups, layouts=LayoutStore(), default_scale=1.0)
+        base.resize(1100, 700)
+        base.show()
+        app.processEvents()
+        base_layout = base.canvas.layout
+        assert base_layout is not None
+        src_area = base_layout.src_canvas[0] * base_layout.src_canvas[1]
+        check(base_layout.canvas == base_layout.src_canvas and base_layout.is_identity,
+              f"初始＝原始版面 {base_layout.src_canvas}（面積 0% 變化）")
+        base._repack(force=True)
+        app.processEvents()
+        area_repacked = base_layout.canvas[0] * base_layout.canvas[1]
+        check(area_repacked <= src_area,
+              f"按「重新排版」-> {base_layout.canvas}（面積 {area_repacked / src_area * 100:.0f}%）")
+        base.canvas.select_all()
+        base.item_spin.setValue(50.0)
+        app.processEvents()
+        base.item_spin.setValue(100.0)
+        app.processEvents()
+        round_trip = base.canvas.layout
+        area_back = round_trip.canvas[0] * round_trip.canvas[1]
+        check(area_back <= src_area,
+              f"50% → 100% 後 -> {round_trip.canvas}（面積 {area_back / src_area * 100:.0f}%）")
+        base.close()
+
+        print("\n[12] 清單多選：批次重排與還原")
+        work2 = Path(tempfile.mkdtemp(prefix="jreditor2_"))
+        try:
+            build_sheet(work2, "sheet")
+            build_sheet(work2, "extra")
+            groups2 = build_sheet_groups(scan_projects([work2]))
+            multi = SheetEditorDialog(groups=groups2, layouts=LayoutStore(), default_scale=0.5)
+            multi.show()
+            app.processEvents()
+            check(multi.sheet_table.rowCount() == 2, f"兩張合圖 -> {multi.sheet_table.rowCount()} 列")
+
+            multi.sheet_table.selectAll()      # 等同 Ctrl+A
+            app.processEvents()
+            check(
+                not multi.padding_spin.isEnabled() and not multi.unpin_all_button.isEnabled()
+                and multi.pack_button.isEnabled() and multi.revert_button.isEnabled(),
+                "多選時只留「重新排版」與「還原原始版面」",
+            )
+            check(multi.canvas._read_only, "多選時畫布唯讀")
+
+            multi._repack_selected()
+            app.processEvents()
+            packed = [multi._working[g.key] for g in multi._groups]
+            check(
+                len(multi._touched) == 2 and all(item.is_packed for item in packed),
+                f"一次重排 2 張 -> {[item.canvas for item in packed]}",
+            )
+
+            multi._revert_selected()
+            app.processEvents()
+            check(
+                all(multi._working[g.key].is_identity for g in multi._groups),
+                "一次還原 2 張為原始版面",
+            )
+            committed, dropped = multi.result_layouts()
+            check(len(committed) == 2 and not dropped, f"套用時回報 {len(committed)} 張")
+
+            # 回到單選：控制項要恢復
+            multi.sheet_table.selectRow(0)
+            app.processEvents()
+            check(multi.padding_spin.isEnabled() and not multi.canvas._read_only,
+                  "回到單選後控制項恢復")
+            multi.close()
+        finally:
+            shutil.rmtree(work2, ignore_errors=True)
+
         print("\n全部通過" if not failed else f"\n失敗 {failed} 項")
         return 1 if failed else 0
     finally:

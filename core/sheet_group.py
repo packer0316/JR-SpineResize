@@ -21,8 +21,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from config.constants import PAGE_ALIGN_NONE
+from config.constants import MAX_PAGE_SIZE, PAGE_ALIGN_NONE
 from core.packer import PackItem, pack
+from core.rect_mapper import align_up, round_half_up
 from models.atlas_data import AtlasPage
 from models.sheet_layout import Placement, Rect, SheetLayout, layout_key
 from models.spine_asset import SpineAsset
@@ -131,10 +132,14 @@ class SheetGroup:
         align: int = PAGE_ALIGN_NONE,
     ) -> SheetLayout:
         """
-        建一份初始版面：所有元件同一個比例，位置尚未決定（呼叫 repack 排）。
+        建一份初始版面：所有元件同一個比例。
 
         元件順序固定為「來源座標由上到下、由左到右」，讓編輯器的清單與
         每次重建的結果都穩定。
+
+        比例是 100% 時**直接沿用原始版面**（位置與畫布都照原檔），不重新排版：
+        什麼都還沒改，版面就不該有任何變化——重排有可能排出比原檔更大的畫布
+        （原檔是美術工具花更多時間排的），「還沒動就先變大」絕對不能發生。
         """
         layout = SheetLayout(
             page_path=self.page_path,
@@ -146,7 +151,16 @@ class SheetGroup:
             placement = Placement(src_rect=rect, names=list(self.regions[rect]))
             placement.set_scale(scale)
             layout.placements.append(placement)
-        repack(layout, hint_width=self.src_canvas[0])
+
+        aligned_src = (
+            align_up(self.src_canvas[0], align), align_up(self.src_canvas[1], align)
+        )
+        if abs(scale - 1.0) < 1e-9 and aligned_src == self.src_canvas:
+            for placement in layout.placements:
+                placement.pos = (placement.src_rect[0], placement.src_rect[1])
+            layout.canvas = self.src_canvas
+        else:
+            repack(layout, hint_width=self.src_canvas[0])
         return layout
 
     def sync_layout(self, layout: SheetLayout) -> list[str]:
@@ -205,6 +219,11 @@ def repack(layout: SheetLayout, hint_width: int = 0) -> list[Placement]:
     重新排版並把畫布縮到最小；回傳排不進去的元件（正常情況是空的）。
 
     手動搬過的元件（``pinned``）位置固定，其餘自動填空隙。
+
+    「原始版面等比縮小」永遠是候選之一：整組同一個比例時，把原版面照比例
+    縮小也是一個合法排法（原檔是美術工具排的，常比啟發式排得更緊）。
+    兩者比面積取小，所以結果**永遠不會比原版面差**——100% 時該候選就是
+    原版面本身，保證面積不變大。
     """
     items = [
         PackItem(
@@ -226,7 +245,66 @@ def repack(layout: SheetLayout, hint_width: int = 0) -> list[Placement]:
         if position is not None:
             item.key.pos = position  # type: ignore[union-attr]
     layout.canvas = result.canvas
-    return [item.key for item in result.overflow]  # type: ignore[misc]
+    overflow = [item.key for item in result.overflow]  # type: ignore[misc]
+    if not overflow:
+        _prefer_source_baseline(layout)
+    return overflow
+
+
+def _prefer_source_baseline(layout: SheetLayout) -> None:
+    """
+    把「原始版面等比縮小」當候選，比排版結果小（或相等）就採用它。
+
+    只在「整組同一個比例、沒有任何固定位置」時有意義：比例不一致或有元件
+    被手動搬過，原版面的相對位置就不再成立。相等面積時偏好原版面——
+    與原檔的 diff 最小，肉眼比對也容易。
+    """
+    scale = layout.uniform_scale
+    if scale is None or not layout.placements:
+        return
+    if any(p.pinned for p in layout.placements):
+        return
+
+    exact = abs(scale - 1.0) < 1e-9
+    placed: list[tuple[Placement, tuple[int, int]]] = []
+    rects: list[Rect] = []
+    for placement in layout.placements:
+        src_x, src_y, _, _ = placement.src_rect
+        w, h = placement.dst_size
+        x = max(0, round_half_up(src_x * scale))
+        y = max(0, round_half_up(src_y * scale))
+        placed.append((placement, (x, y)))
+        rects.append((x, y, w, h))
+
+    canvas_w = align_up(max(1, round_half_up(layout.src_canvas[0] * scale)), layout.align)
+    canvas_h = align_up(max(1, round_half_up(layout.src_canvas[1] * scale)), layout.align)
+    for x, y, w, h in rects:
+        canvas_w = max(canvas_w, align_up(x + w, layout.align))
+        canvas_h = max(canvas_h, align_up(y + h, layout.align))
+    if canvas_w > MAX_PAGE_SIZE or canvas_h > MAX_PAGE_SIZE:
+        return
+    if canvas_w * canvas_h > layout.canvas[0] * layout.canvas[1]:
+        return
+
+    # 縮小後元件間的距離也跟著縮，掉到要求的間距以下就會滲色，不能採用。
+    # 100% 時像素原封不動（沒有重新取樣），維持原檔的間距即可，不另外要求。
+    required = 0 if exact else layout.padding
+    for index, first in enumerate(rects):
+        ax, ay, aw, ah = first
+        for second in rects[index + 1:]:
+            if first == second:
+                continue  # 打包器去重的別名：多個名稱共用同一塊像素
+            bx, by, bw, bh = second
+            gap = max(
+                max(bx - (ax + aw), ax - (bx + bw)),
+                max(by - (ay + ah), ay - (by + bh)),
+            )
+            if gap < required:
+                return
+
+    for placement, position in placed:
+        placement.pos = position
+    layout.canvas = (canvas_w, canvas_h)
 
 
 def repack_fixed(layout: SheetLayout, canvas: tuple[int, int]) -> list[Placement]:

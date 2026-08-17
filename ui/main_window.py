@@ -783,7 +783,11 @@ class MainWindow(QMainWindow):
             project.custom_sheets = sum(
                 1 for path in project.page_paths if layout_key(path) in keys
             )
-        self.project_list.set_custom_layouts(keys)
+        # 清單要連版面的輸出尺寸一起帶：套用版面後「頁面尺寸」欄
+        # 顯示的就是實際會輸出的大小，不是原檔宣告的尺寸
+        self.project_list.set_custom_layouts(
+            {layout.key: layout.canvas for layout in self._layouts}
+        )
         self.detail.set_custom_layouts(keys)
 
     def _remove_selected(self) -> None:

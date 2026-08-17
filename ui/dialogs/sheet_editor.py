@@ -31,7 +31,6 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
-    QSlider,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -79,7 +78,6 @@ class SheetEditorDialog(QDialog):
         self._working: dict[str, SheetLayout] = {}
         self._sources: dict[str, Image.Image | None] = {}
         self._touched: set[str] = set()
-        self._removed: set[str] = set()
         # 開啟這個對話框時「已經套用過」的合圖。點開來看會建一份預覽版面放進
         # _working，但那還不算自訂——只有按過「套用版面」的才算，
         # 所以狀態欄要看這個集合，不能看 _working 有沒有東西。
@@ -125,6 +123,7 @@ class SheetEditorDialog(QDialog):
             "atlas 座標同步更新。<br>"
             "<b>共用同一張合圖的所有 atlas 會一起套用同一份版面</b>——"
             "這樣才不會有一份改了、另一份沒改而輸出壞掉。"
+            "清單可 Ctrl／Shift／Ctrl+A 多選，一次重排或還原多張。"
         )
         header.setWordWrap(True)
         header.setProperty("role", "hint")
@@ -173,7 +172,9 @@ class SheetEditorDialog(QDialog):
         self.sheet_table.setHorizontalHeaderLabels(_SHEET_COLUMNS)
         self.sheet_table.verticalHeader().setVisible(False)
         self.sheet_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.sheet_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # 支援 Ctrl / Shift / Ctrl+A 多選：「重新排版」與「還原原始版面」
+        # 會一次套用到所有選取的合圖
+        self.sheet_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.sheet_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.sheet_table.setShowGrid(False)
         header = self.sheet_table.horizontalHeader()
@@ -183,6 +184,12 @@ class SheetEditorDialog(QDialog):
             header.resizeSection(index, width)
         self.sheet_table.itemSelectionChanged.connect(self._on_sheet_selected)
         box.addWidget(self.sheet_table, 1)
+
+        self.multi_label = QLabel("")
+        self.multi_label.setProperty("role", "hint")
+        self.multi_label.setWordWrap(True)
+        self.multi_label.setVisible(False)
+        box.addWidget(self.multi_label)
 
         self.blocked_label = QLabel("")
         self.blocked_label.setProperty("role", "hint")
@@ -218,6 +225,8 @@ class SheetEditorDialog(QDialog):
 
         self.canvas = SheetCanvas()
         self.canvas.selection_changed.connect(self._sync_selection_panel)
+        # 拖曳中：只刷新讀數（不重排、不算重疊），拖起來才不會頓
+        self.canvas.editing.connect(self._sync_selection_panel)
         self.canvas.layout_changed.connect(self._on_canvas_edited)
         self.canvas.zoom_changed.connect(lambda _scale: self._sync_canvas_title())
         box.addWidget(self.canvas, 1)
@@ -255,55 +264,20 @@ class SheetEditorDialog(QDialog):
         return group
 
     def _build_group_box(self) -> QWidget:
-        group = QGroupBox("整組比例")
+        group = QGroupBox("整張合圖")
         box = QVBoxLayout(group)
         box.setSpacing(6)
 
-        row = QHBoxLayout()
-        self.group_slider = QSlider(Qt.Orientation.Horizontal)
-        self.group_slider.setRange(1, 400)
-        self.group_slider.setValue(100)
-        self.group_slider.valueChanged.connect(self._on_group_slider)
-        row.addWidget(self.group_slider, 1)
-
-        self.group_spin = QDoubleSpinBox()
-        self.group_spin.setRange(MIN_REGION_SCALE * 100, MAX_REGION_SCALE * 100)
-        self.group_spin.setDecimals(1)
-        self.group_spin.setSuffix(" %")
-        self.group_spin.setValue(100.0)
-        self.group_spin.setFixedWidth(88)
-        self.group_spin.valueChanged.connect(self._on_group_spin)
-        row.addWidget(self.group_spin)
-        box.addLayout(row)
-
-        apply_row = QHBoxLayout()
-        apply_all = QPushButton("套用到整組")
-        apply_all.setToolTip("把上面的比例套用到這張合圖的所有元件（含已個別調整過的）")
-        apply_all.clicked.connect(self._apply_group_scale)
-        apply_row.addWidget(apply_all, 1)
-        box.addLayout(apply_row)
-
-        revert_row = QHBoxLayout()
         self.revert_button = QPushButton("還原原始版面")
         self.revert_button.setToolTip(
             "回到來源 atlas 原本的樣子：比例 100%、位置與頁面尺寸都照原檔\n"
             "輸出的 atlas 會與原檔 byte-identical，貼圖像素也維持原樣\n"
-            "（等於「這張合圖不要動」——右側的縮放比例對它不生效，\n"
-            "壓縮設定仍然生效）"
+            "（等於「這張合圖不要動」——全域的縮放比例對它不生效，\n"
+            "壓縮設定仍然生效）\n"
+            "清單多選時會一次還原所有選取的合圖"
         )
-        self.revert_button.clicked.connect(self._revert_layout)
-        revert_row.addWidget(self.revert_button, 1)
-
-        self.reset_button = QPushButton("移除自訂版面")
-        self.reset_button.setToolTip("這張合圖改回照右側設定的全域比例整頁等比縮放")
-        self.reset_button.clicked.connect(self._remove_layout)
-        revert_row.addWidget(self.reset_button, 1)
-        box.addLayout(revert_row)
-
-        self.mixed_label = QLabel("")
-        self.mixed_label.setProperty("role", "hint")
-        self.mixed_label.setWordWrap(True)
-        box.addWidget(self.mixed_label)
+        self.revert_button.clicked.connect(self._revert_selected)
+        box.addWidget(self.revert_button)
         return group
 
     def _build_selection_box(self) -> QWidget:
@@ -330,14 +304,14 @@ class SheetEditorDialog(QDialog):
         box.addLayout(row)
 
         buttons = QHBoxLayout()
-        unpin = QPushButton("取消固定")
-        unpin.setToolTip("讓自動排版重新決定這些元件的位置")
-        unpin.clicked.connect(self._unpin_selection)
-        buttons.addWidget(unpin)
+        self.unpin_button = QPushButton("取消固定")
+        self.unpin_button.setToolTip("讓自動排版重新決定這些元件的位置")
+        self.unpin_button.clicked.connect(self._unpin_selection)
+        buttons.addWidget(self.unpin_button)
 
-        select_all = QPushButton("全選")
-        select_all.clicked.connect(lambda: self.canvas.select_all())
-        buttons.addWidget(select_all)
+        self.select_all_button = QPushButton("全選")
+        self.select_all_button.clicked.connect(lambda: self.canvas.select_all())
+        buttons.addWidget(self.select_all_button)
         box.addLayout(buttons)
         return group
 
@@ -371,10 +345,11 @@ class SheetEditorDialog(QDialog):
         self.auto_check.setChecked(True)
         box.addWidget(self.auto_check)
 
-        pack_button = QPushButton("重新排版（縮到最小）")
-        pack_button.setProperty("role", "primary")
-        pack_button.clicked.connect(lambda: self._repack(force=True))
-        box.addWidget(pack_button)
+        self.pack_button = QPushButton("重新排版（縮到最小）")
+        self.pack_button.setProperty("role", "primary")
+        self.pack_button.setToolTip("清單多選時會一次重排所有選取的合圖")
+        self.pack_button.clicked.connect(self._repack_selected)
+        box.addWidget(self.pack_button)
 
         self.unpin_all_button = QPushButton("取消全部固定並重排")
         self.unpin_all_button.setToolTip(
@@ -432,8 +407,6 @@ class SheetEditorDialog(QDialog):
         layout = self._working.get(group.key)
         if group.key in self._touched:
             text = "已改動"
-        elif group.key in self._removed:
-            text = "已移除"
         elif group.key in self._committed:
             text = "自訂"
         else:
@@ -445,20 +418,34 @@ class SheetEditorDialog(QDialog):
         return item
 
     def _refresh_current_row(self) -> None:
-        if self._current is None:
-            return
-        row = next((i for i, g in enumerate(self._groups) if g is self._current), None)
-        if row is None:
-            return
-        self.sheet_table.setItem(row, 4, self._sheet_state_item(self._current))
+        if self._current is not None:
+            self._refresh_row(self._current)
+
+    def _refresh_row(self, group: SheetGroup) -> None:
+        row = next((i for i, g in enumerate(self._groups) if g is group), None)
+        if row is not None:
+            self.sheet_table.setItem(row, 4, self._sheet_state_item(group))
+
+    def _selected_groups(self) -> list[SheetGroup]:
+        """清單上被選取的合圖（依清單順序）"""
+        rows = sorted({index.row() for index in self.sheet_table.selectedIndexes()})
+        return [self._groups[r] for r in rows if 0 <= r < len(self._groups)]
 
     def _on_sheet_selected(self) -> None:
-        rows = {index.row() for index in self.sheet_table.selectedIndexes()}
-        if not rows:
+        groups = self._selected_groups()
+        if not groups:
+            self._sync_control_states()
             return
-        row = min(rows)
-        if 0 <= row < len(self._groups):
-            self._show_group(self._groups[row])
+        # 畫布顯示「目前列」（最後點到的那一列）；Ctrl+A 之類沒動 current 時維持原樣
+        row = self.sheet_table.currentRow()
+        target = (
+            self._groups[row]
+            if 0 <= row < len(self._groups) and any(g is self._groups[row] for g in groups)
+            else groups[0]
+        )
+        if target is not self._current:
+            self._show_group(target)
+        self._sync_control_states()
 
     # ------------------------------------------------------------ 載入單張合圖
 
@@ -468,22 +455,10 @@ class SheetEditorDialog(QDialog):
             self.canvas.set_sheet(None, None)
             self.canvas_title.setText("")
             self.usage_label.setText("清單上沒有可編輯的合圖。")
-            self._set_controls_enabled(False)
+            self._sync_control_states()
             return
 
-        self._set_controls_enabled(True)
-        layout = self._working.get(group.key)
-        if layout is None:
-            # 第一次看這張合圖：用目前的全域比例當起點，先照原樣排一次
-            layout = group.build_layout(
-                scale=self._default_scale,
-                padding=self.padding_spin.value(),
-                align=self.align_combo.currentData(),
-            )
-            self._working[group.key] = layout
-        # 這裡刻意不把 group.key 從 _removed 拿掉：只是點開來看不該取消「移除」，
-        # 真的動了才算（見 _mark_touched）
-
+        layout = self._ensure_layout(group)
         self.canvas.set_sheet(layout, self._source_for(group))
         self.canvas.fit_to_view()
 
@@ -493,18 +468,32 @@ class SheetEditorDialog(QDialog):
             index = self.align_combo.findData(layout.align)
             if index >= 0:
                 self.align_combo.setCurrentIndex(index)
-            scale = layout.uniform_scale
-            if scale is not None:
-                self.group_spin.setValue(scale * 100)
-                self.group_slider.setValue(int(round(scale * 100)))
         finally:
             self._syncing = False
 
+        self._sync_control_states()
         self._sync_usage(group)
         self._sync_canvas_title()
         self._sync_selection_panel()
         self._sync_stats()
         self._refresh_current_row()
+
+    def _ensure_layout(self, group: SheetGroup, scale: float | None = None) -> SheetLayout:
+        """
+        取這張合圖的工作副本；還沒有就建一份。
+
+        第一次看（或第一次批次處理）這張合圖時，用目前的全域比例當起點，
+        先照原樣排一次——與點開清單看到的起點一致。
+        """
+        layout = self._working.get(group.key)
+        if layout is None:
+            layout = group.build_layout(
+                scale=self._default_scale if scale is None else scale,
+                padding=self.padding_spin.value(),
+                align=self.align_combo.currentData(),
+            )
+            self._working[group.key] = layout
+        return layout
 
     def _source_for(self, group: SheetGroup) -> Image.Image | None:
         if group.key in self._sources:
@@ -518,14 +507,38 @@ class SheetEditorDialog(QDialog):
         self._sources[group.key] = image
         return image
 
-    def _set_controls_enabled(self, enabled: bool) -> None:
+    def _sync_control_states(self) -> None:
+        """
+        依清單選取狀態切換控制項。
+
+        多選時只留「重新排版」與「還原原始版面」（一次套用到所有選取的合圖）；
+        其他調整都是「單張」的概念，多選時一律停用，畫布也改成只供檢視。
+        （item_spin 由 _sync_selection_panel 依畫布選取決定，不在這裡管。）
+        """
+        count = len(self._selected_groups())
+        multi = count > 1
+        single = self._current is not None and not multi
         for widget in (
-            self.group_slider, self.group_spin, self.item_spin,
             self.padding_spin, self.align_combo, self.auto_check,
-            self.reset_button, self.revert_button, self.names_check,
-            self.unpin_all_button,
+            self.unpin_button, self.select_all_button, self.unpin_all_button,
+            self.names_check,
         ):
-            widget.setEnabled(enabled)
+            widget.setEnabled(single)
+
+        active = self._current is not None
+        self.pack_button.setEnabled(active)
+        self.revert_button.setEnabled(active)
+        suffix = f"（{count} 張）" if multi else ""
+        self.pack_button.setText(f"重新排版（縮到最小）{suffix}")
+        self.revert_button.setText(f"還原原始版面{suffix}")
+
+        self.canvas.set_read_only(multi)
+        self.multi_label.setVisible(multi)
+        if multi:
+            self.multi_label.setText(
+                f"已選 {count} 張合圖：「重新排版」與「還原原始版面」"
+                "會一次套用到全部選取"
+            )
 
     def _sync_usage(self, group: SheetGroup) -> None:
         lines = [f"<b>{group.name}</b>　{format_bytes(group.source_bytes)}"]
@@ -558,53 +571,12 @@ class SheetEditorDialog(QDialog):
     # ------------------------------------------------------------ 編輯
 
     def _mark_touched(self) -> None:
-        if self._current is None:
-            return
-        # 真的動了就代表要有版面，取消先前按過的「移除自訂版面」
-        self._removed.discard(self._current.key)
-        self._touched.add(self._current.key)
-        self._refresh_current_row()
+        if self._current is not None:
+            self._mark_group_touched(self._current)
 
-    def _on_group_slider(self, value: int) -> None:
-        if self._syncing:
-            return
-        self._syncing = True
-        try:
-            self.group_spin.setValue(float(value))
-        finally:
-            self._syncing = False
-        self._apply_group_scale()
-
-    def _on_group_spin(self, value: float) -> None:
-        if self._syncing:
-            return
-        self._syncing = True
-        try:
-            self.group_slider.setValue(int(round(value)))
-        finally:
-            self._syncing = False
-        self._apply_group_scale()
-
-    def _apply_group_scale(self) -> None:
-        """
-        整組同一個比例——共用這張合圖的每一份 atlas 都會拿到這個結果。
-
-        會一併取消所有「位置固定」：固定的位置是在別的比例下挑的，換了比例就
-        沒有意義，留著只會讓畫布縮不下去（例如一個固定在 y=760 的元件會讓
-        整張圖即使縮到 17% 仍然高 780px，填充率掉到兩成）。
-        """
-        layout = self.canvas.layout
-        if layout is None:
-            return
-        layout.scale_all(self.group_spin.value() / 100.0)
-        unpinned = self.canvas.unpin_all()
-        self._mark_touched()
-        self._repack(force=True)
-        self._sync_selection_panel()
-        if unpinned and not self.warn_label.text():
-            self.warn_label.setText(
-                f"整組改比例，已取消 {unpinned} 個元件的位置固定並重新排版"
-            )
+    def _mark_group_touched(self, group: SheetGroup) -> None:
+        self._touched.add(group.key)
+        self._refresh_row(group)
 
     def _on_item_scale(self, value: float) -> None:
         if self._syncing or value < MIN_REGION_SCALE * 100:
@@ -658,52 +630,62 @@ class SheetEditorDialog(QDialog):
         if not self.warn_label.text():
             self.warn_label.setText(f"已取消 {count} 個元件的固定並重新排版")
 
-    def _revert_layout(self) -> None:
+    def _revert_selected(self) -> None:
         """
-        還原成來源 atlas 原本的版面。
+        還原成來源 atlas 原本的版面（清單多選時一次還原全部選取）。
 
         刻意**不**接著重新排版：重排會把畫布縮到內容邊界，就不是原檔的樣子了。
         還原後的版面是「恆等版面」，輸出的 atlas 與貼圖都與原檔相同。
         """
-        layout = self.canvas.layout
-        if layout is None:
-            group = self._current
-            if group is None:
+        groups = self._selected_groups()
+        if not groups:
+            if self._current is None:
                 return
-            layout = group.build_layout(scale=1.0, padding=self.padding_spin.value())
-            self._working[group.key] = layout
-            self.canvas.set_sheet(layout, self._source_for(group))
+            groups = [self._current]
+        for group in groups:
+            # 還沒有工作副本的直接以 100% 建：build_layout 在 100% 就是
+            # 原始版面本身，不用先排一次再還原
+            layout = self._ensure_layout(group, scale=1.0)
+            layout.reset_to_source()
+            self._mark_group_touched(group)
 
-        layout.reset_to_source()
-        self._mark_touched()
-        self._syncing = True
-        try:
-            self.group_spin.setValue(100.0)
-            self.group_slider.setValue(100)
-        finally:
-            self._syncing = False
-        self.canvas.fit_to_view()
-        self._sync_stats()
-        self._sync_selection_panel()
-        self._refresh_current_row()
-
-    def _remove_layout(self) -> None:
-        """這張合圖改回「照全域比例整頁等比縮放」"""
-        group = self._current
-        if group is None:
-            return
-        self._working.pop(group.key, None)
-        self._touched.discard(group.key)
-        self._removed.add(group.key)
-        self.canvas.set_sheet(None, None)
-        self.canvas_title.setText("")
-        self.canvas_label.setText(
-            "已移除自訂版面，這張合圖會照全域比例整頁等比縮放。\n"
-            "（在這裡再做任何調整就會重新建立版面）"
-        )
-        self.warn_label.setText("")
-        self._refresh_current_row()
+        if self._current is not None and any(g is self._current for g in groups):
+            self.canvas.fit_to_view()
+            self._sync_stats()
+            self._sync_selection_panel()
         self._sync_footer()
+
+    def _repack_selected(self) -> None:
+        """
+        重新排版（縮到最小）；清單多選時逐張處理，全部標成「已改動」。
+
+        目前顯示的那張走 _repack（會同步檢視、統計與重疊警告），
+        其他張直接重排工作副本即可。
+        """
+        groups = self._selected_groups()
+        if not groups:
+            if self._current is None:
+                return
+            groups = [self._current]
+
+        overflowed: list[str] = []
+        for group in groups:
+            if group is self._current:
+                continue
+            layout = self._ensure_layout(group)
+            if repack(layout, hint_width=layout.src_canvas[0]):
+                overflowed.append(group.name)
+            self._mark_group_touched(group)
+
+        if self._current is not None and any(g is self._current for g in groups):
+            self._mark_touched()
+            self._repack(force=True)
+        self._sync_footer()
+        if overflowed:
+            self.warn_label.setText(
+                f"{len(overflowed)} 張合圖有元件排不進頁面上限，請縮小比例："
+                + "、".join(overflowed[:4])
+            )
 
     def _repack(self, force: bool = False, refit: bool = True) -> None:
         """
@@ -819,22 +801,13 @@ class SheetEditorDialog(QDialog):
                 "畫布縮不下去——可按「取消全部固定並重排」"
             )
         self.warn_label.setText("　".join(messages))
-
-        scale = layout.uniform_scale
-        self.mixed_label.setText(
-            "" if scale is not None else "目前各元件比例不同；按「套用到整組」會全部改成上面的比例"
-        )
         self._sync_canvas_title()
         self._sync_footer()
 
     def _sync_footer(self) -> None:
-        parts = []
-        if self._touched:
-            parts.append(f"已改動 {len(self._touched)} 張合圖")
-        if self._removed:
-            parts.append(f"移除 {len(self._removed)} 張的自訂版面")
         self.footer_label.setText(
-            "、".join(parts) + "（按「套用版面」才會生效）" if parts else "尚未改動任何合圖"
+            f"已改動 {len(self._touched)} 張合圖（按「套用版面」才會生效）"
+            if self._touched else "尚未改動任何合圖"
         )
 
     # ------------------------------------------------------------ 套用
@@ -862,12 +835,13 @@ class SheetEditorDialog(QDialog):
         回傳（要寫入的版面, 要移除版面的貼圖鍵）。
 
         只回報真的動過的——沒改的合圖維持原狀，不會因為「打開看過」
-        就被塞進一份自訂版面。
+        就被塞進一份自訂版面。「移除自訂版面」的入口已拿掉（要回到原檔
+        請用「還原原始版面」），第二個值恆為空——保留它讓呼叫端流程不變。
         """
         layouts = [
             self._working[key] for key in self._touched if key in self._working
         ]
-        return layouts, set(self._removed)
+        return layouts, set()
 
 
 # ---------------------------------------------------------------- 輔助

@@ -61,7 +61,10 @@ class SheetCanvas(QWidget):
     """單一合圖的版面編輯畫布"""
 
     selection_changed = pyqtSignal()
-    layout_changed = pyqtSignal(bool)   # True 代表尺寸變了（需要重新排版）
+    layout_changed = pyqtSignal(bool)   # 拖曳結束；True 代表尺寸變了（需要重新排版）
+    # 拖曳「進行中」每一步都會發：右側的尺寸要邊拖邊更新，不能等放開才跳一次。
+    # 只用來刷新讀數，不觸發重新排版，所以拖再快也不會卡。
+    editing = pyqtSignal()
     zoom_changed = pyqtSignal(float)
 
     def __init__(self, parent=None) -> None:
@@ -82,6 +85,9 @@ class SheetCanvas(QWidget):
         self._offset = QPointF(0.0, 0.0)     # 畫布原點在畫面上的位置
         self._fit_pending = True
         self._show_names = False
+        # 清單多選合圖時畫布只供檢視：批次動作以合圖為單位，
+        # 這時還讓人拖元件會以為改到全部選取，實際只動到顯示中的那張
+        self._read_only = False
 
     # ------------------------------------------------------------ 載入
 
@@ -110,8 +116,21 @@ class SheetCanvas(QWidget):
         self.update()
 
     def select_all(self) -> None:
-        if self._layout is not None:
+        if self._layout is not None and not self._read_only:
             self.select(list(self._layout.placements))
+
+    def set_read_only(self, read_only: bool) -> None:
+        """只供檢視：平移與縮放照常，選取與編輯全部關閉"""
+        if read_only == self._read_only:
+            return
+        self._read_only = read_only
+        if read_only:
+            self._drag = None
+            self._rubber = None
+            if self._selected:
+                self._selected = []
+                self.selection_changed.emit()
+        self.update()
 
     def unpin_all(self) -> int:
         """取消所有元件的位置固定；回傳原本被固定的數量"""
@@ -257,7 +276,7 @@ class SheetCanvas(QWidget):
             self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
             return
 
-        if event.button() != Qt.MouseButton.LeftButton:
+        if event.button() != Qt.MouseButton.LeftButton or self._read_only:
             return
 
         corner = self._handle_at(position)
@@ -357,6 +376,9 @@ class SheetCanvas(QWidget):
         self.update()
 
     def _update_cursor(self, position: QPointF) -> None:
+        if self._read_only:
+            self.unsetCursor()
+            return
         corner = self._handle_at(position)
         if corner in ("tl", "br"):
             self.setCursor(QCursor(Qt.CursorShape.SizeFDiagCursor))
@@ -390,6 +412,7 @@ class SheetCanvas(QWidget):
                 max(0, min(canvas_h - h, start[1] + dy)),
             )
             placement.pinned = True
+        self.editing.emit()
         self.update()
 
     def _apply_resize(self, position: QPointF, drag: _Drag) -> None:
@@ -432,11 +455,12 @@ class SheetCanvas(QWidget):
                     max(0, anchor_y + round((start[1] - anchor_y) * ratio)),
                 )
                 placement.pinned = True
+        self.editing.emit()
         self.update()
 
     def nudge(self, dx: int, dy: int) -> None:
         """方向鍵微調（會把元件固定住）"""
-        if self._layout is None or not self._selected:
+        if self._layout is None or not self._selected or self._read_only:
             return
         canvas_w, canvas_h = self._layout.canvas
         for placement in self._selected:
